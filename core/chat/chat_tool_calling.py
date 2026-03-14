@@ -221,8 +221,35 @@ class ToolCallingEngine:
                     return {"function_call": inner}
             except json.JSONDecodeError as e:
                 logger.debug(f"JSON parse failed for raw format: {e}")
+        # Format 5: DeepSeek DSML leaked training markup
+        # When DeepSeek fails to produce structured tool_calls, it outputs
+        # its internal DSML tags as plain text instead of structured API output.
+        # Example: <｜DSML｜invoke name="notepad_read"></｜DSML｜invoke>
+        dsml_pattern = r'<[｜|]DSML[｜|]invoke\s+name="([^"]+)"[^>]*>(.*?)</[｜|]DSML[｜|]invoke>'
+        dsml_match = re.search(dsml_pattern, text, re.DOTALL)
+
+        if dsml_match:
+            func_name = dsml_match.group(1).strip()
+            args_text = dsml_match.group(2).strip()
+
+            func_args = {}
+            if args_text:
+                try:
+                    func_args = json.loads(args_text)
+                except json.JSONDecodeError:
+                    # Try extracting a JSON object from within the args text
+                    json_inner = re.search(r'\{.*\}', args_text, re.DOTALL)
+                    if json_inner:
+                        try:
+                            func_args = json.loads(json_inner.group())
+                        except json.JSONDecodeError:
+                            logger.debug(f"Could not parse DSML arguments: {args_text[:100]}")
+
+            logger.info(f"[DSML] Parsed leaked DeepSeek markup -> tool call: {func_name}({func_args})")
+            return {"function_call": {"name": func_name, "arguments": func_args}}
 
         return None
+        
 
     def format_tool_calls_for_conversation(self, tool_calls):
         """Convert tool_calls to proper format."""
