@@ -53,6 +53,7 @@ DEFAULT_CREDENTIALS = {
     },
     "email_accounts": {},
     "bitcoin_wallets": {},
+    "gcal_accounts": {},
     "ssh": {
         "servers": []
     },
@@ -72,6 +73,8 @@ PROVIDER_ENV_VARS = {
     'grok': 'XAI_API_KEY',
     'featherless': 'FEATHERLESS_API_KEY',
     'gemini': 'GOOGLE_API_KEY',
+    'deepseek': 'DEEPSEEK_API_KEY',
+    # 'ollama' is local - no API key needed
     # 'other' has no standard env var - fully manual
 }
 
@@ -619,17 +622,29 @@ class CredentialsManager:
     # =========================================================================
 
     def get_email_account(self, scope: str = 'default') -> dict:
-        """Get email account for a scope. App password is unscrambled on read."""
+        """Get email account for a scope. Secrets are unscrambled on read."""
         accounts = self._credentials.get('email_accounts', {})
         acct = accounts.get(scope, {})
-        return {
+        result = {
             'address': acct.get('address', ''),
             'app_password': self._unscramble(acct.get('app_password', '')),
-            'imap_server': acct.get('imap_server', 'imap.gmail.com'),
-            'smtp_server': acct.get('smtp_server', 'smtp.gmail.com'),
+            'auth_type': acct.get('auth_type', 'password'),
+            'imap_server': acct.get('imap_server', ''),
+            'smtp_server': acct.get('smtp_server', ''),
             'imap_port': acct.get('imap_port', 993),
             'smtp_port': acct.get('smtp_port', 465),
         }
+        # Include OAuth fields if present
+        if result['auth_type'] == 'oauth2':
+            result.update({
+                'oauth_client_id': acct.get('oauth_client_id', ''),
+                'oauth_client_secret': self._unscramble(acct.get('oauth_client_secret', '')),
+                'oauth_tenant_id': acct.get('oauth_tenant_id', 'common'),
+                'oauth_refresh_token': self._unscramble(acct.get('oauth_refresh_token', '')),
+                'oauth_access_token': acct.get('oauth_access_token', ''),
+                'oauth_expires_at': acct.get('oauth_expires_at', 0),
+            })
+        return result
 
     def set_email_account(self, scope: str, address: str, app_password: str,
                           imap_server: str = 'imap.gmail.com',
@@ -673,23 +688,75 @@ class CredentialsManager:
         return True
 
     def list_email_accounts(self) -> list:
-        """List all email accounts (no passwords)."""
+        """List all email accounts (no passwords/tokens)."""
         accounts = self._credentials.get('email_accounts', {})
         result = []
         for scope, acct in accounts.items():
             result.append({
                 'scope': scope,
                 'address': acct.get('address', ''),
-                'imap_server': acct.get('imap_server', 'imap.gmail.com'),
-                'smtp_server': acct.get('smtp_server', 'smtp.gmail.com'),
+                'auth_type': acct.get('auth_type', 'password'),
+                'imap_server': acct.get('imap_server', ''),
+                'smtp_server': acct.get('smtp_server', ''),
                 'imap_port': acct.get('imap_port', 993),
                 'smtp_port': acct.get('smtp_port', 465),
             })
         return result
 
+    def set_email_oauth_account(self, scope: str, address: str,
+                                imap_server: str, smtp_server: str,
+                                imap_port: int, smtp_port: int,
+                                oauth_client_id: str, oauth_client_secret: str,
+                                oauth_tenant_id: str, oauth_refresh_token: str,
+                                oauth_access_token: str = '', oauth_expires_at: float = 0) -> bool:
+        """Set an OAuth2-authenticated email account for a scope."""
+        try:
+            if 'email_accounts' not in self._credentials:
+                self._credentials['email_accounts'] = {}
+
+            self._credentials['email_accounts'][scope] = {
+                'address': address,
+                'auth_type': 'oauth2',
+                'imap_server': imap_server,
+                'smtp_server': smtp_server,
+                'imap_port': imap_port,
+                'smtp_port': smtp_port,
+                'oauth_client_id': oauth_client_id,
+                'oauth_client_secret': self._scramble(oauth_client_secret) if oauth_client_secret else '',
+                'oauth_tenant_id': oauth_tenant_id,
+                'oauth_refresh_token': self._scramble(oauth_refresh_token) if oauth_refresh_token else '',
+                'oauth_access_token': oauth_access_token,
+                'oauth_expires_at': oauth_expires_at,
+            }
+
+            if not self._save():
+                logger.error(f"Failed to persist OAuth email account '{scope}' to disk")
+                return False
+
+            logger.info(f"Set OAuth email account for scope '{scope}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set OAuth email account '{scope}': {e}")
+            return False
+
+    def update_email_oauth_tokens(self, scope: str, access_token: str, expires_at: float,
+                                   refresh_token: str = '') -> bool:
+        """Update OAuth tokens for an existing email account (called after token refresh)."""
+        accounts = self._credentials.get('email_accounts', {})
+        if scope not in accounts:
+            return False
+        acct = accounts[scope]
+        acct['oauth_access_token'] = access_token
+        acct['oauth_expires_at'] = expires_at
+        if refresh_token:
+            acct['oauth_refresh_token'] = self._scramble(refresh_token)
+        return self._save()
+
     def has_email_account(self, scope: str = 'default') -> bool:
         """Check if email account exists and has credentials."""
         acct = self.get_email_account(scope)
+        if acct.get('auth_type') == 'oauth2':
+            return bool(acct['address'] and acct.get('oauth_refresh_token'))
         return bool(acct['address'] and acct['app_password'])
 
     # Backwards-compat wrappers (existing code uses these)
@@ -780,6 +847,88 @@ class CredentialsManager:
         """Check if bitcoin wallet exists for scope."""
         w = self.get_bitcoin_wallet(scope)
         return bool(w['wif'])
+
+    # =========================================================================
+    # Google Calendar
+    # =========================================================================
+
+    def get_gcal_account(self, scope: str = 'default') -> dict:
+        """Get Google Calendar account for a scope. Tokens are unscrambled on read."""
+        accounts = self._credentials.get('gcal_accounts', {})
+        acct = accounts.get(scope, {})
+        return {
+            'client_id': acct.get('client_id', ''),
+            'client_secret': self._unscramble(acct.get('client_secret', '')),
+            'refresh_token': self._unscramble(acct.get('refresh_token', '')),
+            'calendar_id': acct.get('calendar_id', 'primary'),
+            'label': acct.get('label', scope),
+        }
+
+    def set_gcal_account(self, scope: str, client_id: str, client_secret: str,
+                         calendar_id: str = 'primary', refresh_token: str = '',
+                         label: str = '') -> bool:
+        """Set Google Calendar account for a scope. Secrets are scrambled before save."""
+        try:
+            if 'gcal_accounts' not in self._credentials:
+                self._credentials['gcal_accounts'] = {}
+
+            self._credentials['gcal_accounts'][scope] = {
+                'client_id': client_id,
+                'client_secret': self._scramble(client_secret) if client_secret else '',
+                'refresh_token': self._scramble(refresh_token) if refresh_token else '',
+                'calendar_id': calendar_id or 'primary',
+                'label': label or scope,
+            }
+
+            if not self._save():
+                logger.error(f"Failed to persist gcal account '{scope}' to disk")
+                return False
+
+            logger.info(f"Set gcal account for scope '{scope}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set gcal account '{scope}': {e}")
+            return False
+
+    def update_gcal_tokens(self, scope: str, refresh_token: str, access_token: str = '', expires_at: float = 0) -> bool:
+        """Update OAuth tokens for an existing gcal account (called after OAuth callback)."""
+        accounts = self._credentials.get('gcal_accounts', {})
+        if scope not in accounts:
+            return False
+        accounts[scope]['refresh_token'] = self._scramble(refresh_token) if refresh_token else accounts[scope].get('refresh_token', '')
+        accounts[scope]['access_token'] = access_token  # Short-lived, no need to encrypt
+        accounts[scope]['expires_at'] = expires_at
+        return self._save()
+
+    def delete_gcal_account(self, scope: str) -> bool:
+        """Remove a Google Calendar account by scope."""
+        accounts = self._credentials.get('gcal_accounts', {})
+        if scope not in accounts:
+            return False
+        del accounts[scope]
+        if not self._save():
+            return False
+        logger.info(f"Deleted gcal account '{scope}'")
+        return True
+
+    def list_gcal_accounts(self) -> list:
+        """List all gcal accounts (no secrets)."""
+        accounts = self._credentials.get('gcal_accounts', {})
+        result = []
+        for scope, acct in accounts.items():
+            result.append({
+                'scope': scope,
+                'label': acct.get('label', scope),
+                'client_id': acct.get('client_id', ''),  # Not secret — shown in OAuth URLs
+                'calendar_id': acct.get('calendar_id', 'primary'),
+                'has_token': bool(acct.get('refresh_token', '')),
+            })
+        return result
+
+    def has_gcal_account(self, scope: str = 'default') -> bool:
+        """Check if gcal account exists and has a refresh token."""
+        acct = self.get_gcal_account(scope)
+        return bool(acct['client_id'] and acct['refresh_token'])
 
     # =========================================================================
     # SSH

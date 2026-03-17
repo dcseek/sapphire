@@ -63,10 +63,10 @@
     "STT_FIREWORKS_API_KEY": "",
     "STT_FIREWORKS_MODEL": "whisper-v3-turbo",
     "FASTER_WHISPER_CUDA_DEVICE": 0,
-    "FASTER_WHISPER_DEVICE": "cpu",
+    "FASTER_WHISPER_DEVICE": "cuda",
     "FASTER_WHISPER_COMPUTE_TYPE": "int8",
     "FASTER_WHISPER_BEAM_SIZE": 3,
-    "FASTER_WHISPER_NUM_WORKERS": 8,
+    "FASTER_WHISPER_NUM_WORKERS": 4,
     "FASTER_WHISPER_VAD_FILTER": true
   },
   
@@ -196,6 +196,25 @@
         "enabled": false,
         "use_as_fallback": true
       },
+      "deepseek": {
+        "provider": "openai",
+        "display_name": "DeepSeek",
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model": "deepseek-chat",
+        "timeout": 10.0,
+        "enabled": false,
+        "use_as_fallback": true
+      },
+      "ollama": {
+        "provider": "openai",
+        "display_name": "Ollama (Local)",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "deepseek-v3:latest",
+        "timeout": 0.5,
+        "enabled": true,
+        "use_as_fallback": true
+      },
       "other": {
         "provider": "openai",
         "display_name": "Other (OpenAI Compatible)",
@@ -218,7 +237,7 @@
         "reasoning_summary": "detailed"
       }
     },
-    "LLM_FALLBACK_ORDER": ["lmstudio", "claude", "gemini", "fireworks", "featherless", "openai", "other"],
+    "LLM_FALLBACK_ORDER": ["ollama", "lmstudio", "deepseek", "claude", "gemini", "fireworks", "featherless", "openai", "other"],
     "MODEL_GENERATION_PROFILES": {
       "_comment": "Balanced generation params per model. Edit values here to tune.",
       "__fallback__": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
@@ -257,7 +276,21 @@
       "Qwen/Qwen3-32B": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "openai/gpt-oss-120b": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "moonshotai/Kimi-K2.5": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
-      "meta-llama/Llama-3.3-70B-Instruct": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 }
+      "meta-llama/Llama-3.3-70B-Instruct": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+
+      "deepseek-chat": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "deepseek-reasoner": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+
+      "deepseek-v3:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "deepseek-r1:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "llama3.3:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "llama3.2:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "qwen3:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "mistral:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "gemma3:latest": { "temperature": 0.8, "top_p": 0.95, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "phi4:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "codellama:latest": { "temperature": 0.3, "top_p": 0.7, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
+      "command-r:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 }
     },
     "FORCE_THINKING": false,
     "THINKING_PREFILL": "<think>Okay, let me see. I need to act like a duck and only speak in 'quack's so that",

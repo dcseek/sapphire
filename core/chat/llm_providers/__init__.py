@@ -4,6 +4,8 @@ Multi-provider LLM abstraction layer.
 
 Supports:
 - lmstudio: LM Studio (local, no API key needed)
+- ollama: Ollama (local, no API key needed, multiple models)
+- deepseek: DeepSeek API (cloud, OpenAI-compatible)
 - claude: Anthropic Claude API
 - fireworks: Fireworks.ai 
 - openai: OpenAI (auto-selects Completions vs Responses based on model)
@@ -187,6 +189,40 @@ PROVIDER_METADATA = {
         'is_local': False,
         'privacy_check_whitelist': True,
         'default_timeout': 10.0,
+    },
+    'deepseek': {
+        'display_name': 'DeepSeek',
+        'provider_class': 'openai',
+        'required_fields': ['base_url', 'api_key', 'model'],
+        'optional_fields': ['timeout'],
+        'model_options': {
+            'deepseek-chat': 'DeepSeek Chat (V3.2)',
+            'deepseek-reasoner': 'DeepSeek Reasoner (R1)',
+        },
+        'is_local': False,
+        'default_timeout': 10.0,
+        'api_key_env': 'DEEPSEEK_API_KEY',
+    },
+    'ollama': {
+        'display_name': 'Ollama (Local)',
+        'provider_class': 'openai',
+        'required_fields': ['base_url', 'model'],
+        'optional_fields': ['timeout'],
+        'model_options': {
+            'deepseek-v3:latest': 'DeepSeek V3',
+            'deepseek-r1:latest': 'DeepSeek R1',
+            'llama3.3:latest': 'Llama 3.3 70B',
+            'llama3.2:latest': 'Llama 3.2',
+            'qwen3:latest': 'Qwen 3',
+            'mistral:latest': 'Mistral',
+            'gemma3:latest': 'Gemma 3',
+            'phi4:latest': 'Phi-4',
+            'codellama:latest': 'Code Llama',
+            'command-r:latest': 'Command R',
+        },
+        'is_local': True,
+        'privacy_check_whitelist': True,
+        'default_timeout': 0.5,
     },
 }
 

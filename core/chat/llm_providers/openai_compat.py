@@ -4,7 +4,9 @@ OpenAI-compatible provider.
 
 Handles:
 - LM Studio (local)
+- Ollama (local, multiple models)
 - llama.cpp server (local)
+- DeepSeek API (cloud, OpenAI-compatible)
 - Fireworks.ai (cloud)
 - OpenRouter (cloud)
 - Any OpenAI-compatible API
@@ -48,11 +50,30 @@ class OpenAICompatProvider(BaseProvider):
         else:
             self._fireworks_session_id = None
 
+        # Detect Ollama endpoint for special handling
+        self._is_ollama = self._detect_ollama()
+        # Detect DeepSeek API endpoint
+        self._is_deepseek_api = 'api.deepseek.com' in (self.base_url or '').lower()
+
         logger.info(f"OpenAI-compat provider initialized: {self.base_url}")
     
     @property
     def provider_name(self) -> str:
         return self.config.get('provider', 'openai')
+    
+    def _detect_ollama(self) -> bool:
+        """Detect if this is an Ollama endpoint."""
+        base = (self.base_url or '').lower()
+        # Default Ollama port is 11434
+        return ':11434' in base
+    
+    def _is_deepseek_model(self) -> bool:
+        """Check if the current model is a DeepSeek model (API or local via Ollama)."""
+        model = (self.model or '').lower()
+        return (
+            self._is_deepseek_api or
+            'deepseek' in model
+        )
     
     @property
     def supports_images(self) -> bool:
@@ -81,6 +102,20 @@ class OpenAICompatProvider(BaseProvider):
             vision_indicators = ['llava', 'vision', 'vl', 'pixtral', 'qwen2-vl']
             supported = any(ind in model for ind in vision_indicators)
             logger.debug(f"[MULTIMODAL] Fireworks: model={model}, multimodal={supported}")
+            return supported
+        
+        # DeepSeek API - no vision support on standard chat models
+        if 'api.deepseek.com' in base_url:
+            vision_indicators = ['vision', 'vl']
+            supported = any(ind in model for ind in vision_indicators)
+            logger.debug(f"[MULTIMODAL] DeepSeek API: model={model}, multimodal={supported}")
+            return supported
+        
+        # Ollama - check model name for vision capability
+        if ':11434' in base_url:
+            vision_indicators = ['llava', 'vision', 'vl', 'bakllava', 'cogvlm', 'minicpm-v', 'moondream']
+            supported = any(ind in model for ind in vision_indicators)
+            logger.debug(f"[MULTIMODAL] Ollama: model={model}, multimodal={supported}")
             return supported
         
         # OpenRouter - check model name for vision capability
@@ -172,6 +207,13 @@ class OpenAICompatProvider(BaseProvider):
         - Use max_completion_tokens instead of max_tokens
         - Don't support temperature, top_p, presence_penalty, frequency_penalty
         
+        DeepSeek Reasoner (R1):
+        - Uses max_completion_tokens instead of max_tokens
+        - Doesn't support temperature, top_p, penalties
+        
+        Ollama models:
+        - Don't support presence_penalty / frequency_penalty (strip them)
+        
         This handles conversions transparently so callers don't need to care.
         """
         if not params:
@@ -189,6 +231,12 @@ class OpenAICompatProvider(BaseProvider):
             model_lower.startswith('gpt-5') or
             model_lower.startswith('o1') or
             model_lower.startswith('o3')
+        )
+
+        # Detect DeepSeek Reasoner (R1) — reasoning model, restricted params
+        is_deepseek_reasoner = (
+            model_lower == 'deepseek-reasoner' or
+            'deepseek-r1' in model_lower
         )
 
         # Detect Grok models (don't support penalty params or stop)
@@ -220,6 +268,31 @@ class OpenAICompatProvider(BaseProvider):
 
             if removed:
                 logger.debug(f"Filtered unsupported params for {self.model}: {removed}")
+
+        elif is_deepseek_reasoner:
+            # DeepSeek R1 reasoner: max_tokens → max_completion_tokens, strip sampling params
+            if 'max_tokens' in result:
+                result['max_completion_tokens'] = result.pop('max_tokens')
+
+            removed = []
+            for unsupported in ['temperature', 'top_p', 'presence_penalty', 'frequency_penalty']:
+                if unsupported in result:
+                    result.pop(unsupported)
+                    removed.append(unsupported)
+
+            if removed:
+                logger.debug(f"Filtered unsupported params for DeepSeek reasoner {self.model}: {removed}")
+
+        elif self._is_ollama:
+            # Ollama's OpenAI-compat layer doesn't support penalty params
+            removed = []
+            for unsupported in ['presence_penalty', 'frequency_penalty']:
+                if unsupported in result:
+                    result.pop(unsupported)
+                    removed.append(unsupported)
+
+            if removed:
+                logger.debug(f"Filtered unsupported params for Ollama {self.model}: {removed}")
         
         return result
     
