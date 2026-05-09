@@ -206,6 +206,7 @@ PROVIDER_METADATA = {
         'required_fields': ['base_url', 'api_key', 'model'],
         'optional_fields': ['timeout'],
         'model_options': {
+            'deepseek-v4-flash': 'DeepSeek V4 Flash',
             'deepseek-chat': 'DeepSeek Chat (V3.2)',
             'deepseek-reasoner': 'DeepSeek Reasoner (R1)',
         },
@@ -225,6 +226,7 @@ PROVIDER_METADATA = {
             'llama3.2:latest': 'Llama 3.2',
             'qwen3:latest': 'Qwen 3',
             'mistral:latest': 'Mistral',
+            'gemma4:latest': 'Gemma 4',
             'gemma3:latest': 'Gemma 3',
             'phi4:latest': 'Phi-4',
             'codellama:latest': 'Code Llama',
@@ -232,7 +234,7 @@ PROVIDER_METADATA = {
         },
         'is_local': True,
         'privacy_check_whitelist': True,
-        'default_timeout': 0.5,
+        'default_timeout': 60.0,
     },
 }
 

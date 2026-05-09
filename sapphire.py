@@ -142,9 +142,13 @@ class VoiceChatSystem:
         # Re-apply toolset now that plugin tools are registered
         # (toolset was applied before plugins loaded, so plugin tools were missed)
         fm = self.llm_chat.function_manager
-        if fm.current_toolset_name and fm.current_toolset_name != "none":
-            fm.update_enabled_functions([fm.current_toolset_name])
-            logger.info(f"Toolset '{fm.current_toolset_name}' re-applied after plugin scan")
+        ts_name = fm.current_toolset_name
+        if ts_name and ts_name != "none":
+            if not fm.is_valid_toolset(ts_name):
+                logger.warning(f"Toolset '{ts_name}' not found — falling back to 'default'")
+                ts_name = "default"
+            fm.update_enabled_functions([ts_name])
+            logger.info(f"Toolset '{ts_name}' re-applied after plugin scan")
 
         # RAG orphan cleanup runs AFTER plugin_loader.scan() (Phase 4 reorder).
         # Previously this ran at line 100, BEFORE plugin loading, which meant it
@@ -244,8 +248,13 @@ class VoiceChatSystem:
             toolset_key = "toolset" if "toolset" in settings else "ability" if "ability" in settings else None
             if toolset_key:
                 toolset_name = settings[toolset_key]
-                self.llm_chat.function_manager.update_enabled_functions([toolset_name])
-                logger.info(f"Applied toolset on startup: {toolset_name}")
+                fm = self.llm_chat.function_manager
+                if not fm.is_valid_toolset(toolset_name):
+                    logger.warning(f"Toolset '{toolset_name}' not valid at startup — deferring to post-plugin-scan apply")
+                    toolset_name = None
+                if toolset_name:
+                    fm.update_enabled_functions([toolset_name])
+                    logger.info(f"Applied toolset on startup: {toolset_name}")
             
             logger.info(f"Applied chat settings on startup")
         except Exception as e:

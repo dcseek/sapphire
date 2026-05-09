@@ -177,7 +177,7 @@
         "display_name": "DeepSeek",
         "base_url": "https://api.deepseek.com/v1",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "timeout": 10.0,
         "enabled": false,
         "use_as_fallback": true
@@ -186,8 +186,8 @@
         "provider": "openai",
         "display_name": "Ollama (Local)",
         "base_url": "http://127.0.0.1:11434/v1",
-        "model": "deepseek-v3:latest",
-        "timeout": 0.5,
+        "model": "gemma4:latest",
+        "timeout": 60.0,
         "enabled": true,
         "use_as_fallback": true
       },
@@ -270,6 +270,7 @@
       "moonshotai/Kimi-K2.5": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "meta-llama/Llama-3.3-70B-Instruct": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
 
+      "deepseek-v4-flash": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 131072, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "deepseek-chat": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "deepseek-reasoner": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 8192, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
 
@@ -279,6 +280,7 @@
       "llama3.2:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "qwen3:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "mistral:latest": { "temperature": 0.75, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
+      "gemma4:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 131072, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "gemma3:latest": { "temperature": 0.8, "top_p": 0.95, "max_tokens": 4096, "presence_penalty": 0.1, "frequency_penalty": 0.1 },
       "phi4:latest": { "temperature": 0.7, "top_p": 0.9, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
       "codellama:latest": { "temperature": 0.3, "top_p": 0.7, "max_tokens": 4096, "presence_penalty": 0.0, "frequency_penalty": 0.0 },
