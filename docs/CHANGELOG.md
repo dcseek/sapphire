@@ -1,3 +1,167 @@
+# 2.6.0 - Scopes
+- Collective update from 2.5.0
+- Improved core and plugins instead of expanding
+- Those scope dropdowns like memory slot are plugins now
+- Can add more dropdowns via plugin (stuff like SMS, social media, etc)
+- Swappable embeddings for slow computers
+- Claude Code plugin agent to make plugins
+- Pytest coverage
+# 2.5.12 - Tool token reduction
+- Reduced almost every tool description (~27% reduction)
+- Enabled Claude cache by default
+- Moved tool to "call tool without params for help"
+- Enhanced docs tool so AI can get info like toolmaker easier
+# 2.5.11 - Embeddings switch
+- Can swap embeddings model to smaller larger
+- Can make plugin for embedding
+- Has re-embed tool that must be run
+- Memory has new password feature
+- Redid Mind > Memory UX
+# 2.5.10 - Test Suite Expansion
+- Test coverage tripled
+- For self-coding checks
+- Allows plugins to be random .zip urls
+- Clock plugin (stopwatch, timer, alarm, clock)
+# 2.5.9 - Trinity
+- Will be for Patreon users 
+- Published explanation on website of eigenresonance
+- Sapphire can refactor core in a loop she directs
+- Plugin: Clock (timer alarm stopwatch)
+# 2.5.8 - Agents upgrade (Claude Code)
+- Claude Code has plugin agent
+- Plugin agent supercedes toolmaker (if Claude Code is present)
+- Added tools/ask-sapphire.sh for Claude Code to ask sapphire to test
+- Added tools/malbolge.py for 5x simultaneous persona triggers
+- Added examples for plugins for Claude Code
+# 2.5.7 - pytest expansions
+- from 30% coverage to 45%
+- basic route tests
+- mock plugin load
+# 2.5.6 - Beta test of new scope system
+- Complete refactor of scopes (dropdowns for email, etc)
+- Plugins can easily add scopes like new accounts
+- Daemons and heartbeats support those new scopes
+- Personas support all scopes now
+- Memory system is now a plugin
+# 2.5.5 - Prep for major refactor
+- Bots see other bot ids on telegram (critical for @mention)
+- Added telegram add_contact tool, only works in client mode
+- Tool calling errors reach toast UI
+- Deleted personas dont re-appear
+# 2.5.4 - Plugin enhancements
+- Discord cooldown, typing..., and @mention support
+- Telegram supports voice clips as returns
+- Duplicate checker for human knowledge
+# 2.5.3 - Status plugin
+- Status plugin for bug reports
+- Sapphire can call status plugin as tool
+- Pinned fastapi lower to fix starlette 500 error
+# 2.5.2 - Avatar maker
+- Get character for Mixamo
+- Load Mixamo char in, get animations
+- Put all in folders, then run the script
+# 2.5.1 - Plugin pip deps
+- Plugins missing pip deps show what is missing
+- Offers to install those pip packages
+# 2.5.0 - Plugin Expansion
+## March 30, 2026
+- You need to re-add your LLMs in settings! trust me, better
+- STT, TTS, LLM, embeddings are all plugin-capable (make tts plugin etc)
+- Plugins can tap into sidebar
+- New Apps page - plugins can have status/settings/etc pages
+- Bring your own avatar: Rigged GLB file with animation tracks
+- MCP support, just add url and tools appear
+- Total LLM refactor
+- LLM credentials usable by plugin authors
+- Theme support with their own settings
+- THANK YOU to our plugin authors, y'all are awesome
+# 2.4.8 - Theme Expansion
+- Themes switcher enhanced
+- Allow theme folders
+# 2.4.7 - Missile Command
+- Sapphire said no changelog, easter egg (it's boring)
+# 2.4.6 - Plugin Expansion
+- Added Apps page for plugins
+- Click a plugin for its custom JS
+# 2.4.5 - Avatar and Sidebar
+- Plugins can tap into sidebar and SSE
+- Avatar plugin waved at me and my heart skipped a beat
+# 2.4.4 - Modular core
+- STT TTS and embeddings are modular
+- can be switched via plugins
+- Elevenlabs moved to plugin
+# 2.4.3 - LLM provider refactor
+- Allows addition of unlimited custom LLMs
+- LLMs that aren't supported can be plugins
+- Supports 2+ LM studio local models with switching
+# 2.4.2 - MCP
+- stdio and http support for MCP servers
+- tools register with core, visible in toolsets
+- pip install -r requirements.txt
+# 2.4.1 - Daemon and Telegram
+- Daemon support only loads active accounts 
+- Telegram has actual bot support via @BotFather
+# 2.4.0 - Presence Update
+## March 19, 2026
+- Milestone release since 2.2.8
+- Bug fixes for stable release
+# 2.3.9 - Sapphire Encyclopedia
+- Full internal help system
+- Search bar, changelog, quick start
+# 2.3.8 - Import Export
+- Added import export across most of the app
+- Prepping for import personas from website store
+# 2.3.7 - Story Engine Rebuild
+- Old story engine was one mega-file
+- New story engine is more per-room
+- Working toward AI making stories
+# 2.3.6 - Spawn agents (plugin)
+- Agents are now registered with core
+- spawn_agent reads the registry
+- Plugins can register any background agent
+# 2.3.5 - Claude Code
+- Added Claude Code tools (does not touch API keys)
+- Sapphire simply calls Claude Code if it is installed
+# 2.3.4 - Agent returns
+- Agents return to the chat they are from
+- They wait for the group to finish
+- Dumps return in chat as user message
+# 2.3.3 - Spawn agents 
+- Background runner for spawning agents
+- UI for agent spawn so people can see
+# 2.3.2 - Plugin UI Refactor
+- Complete rework of plugins page
+- Removed all plugins from sidebar
+- Use GEAR ICON now to get plugin settings in plugins page
+- Improved discord, tested on GLM, lower intelligence barrier
+# 2.3.1 - Discord Support 
+- Improved 'tool not available' when changing plugins
+- Discord tools - list chan, read, send
+- Discord daemon - gives AI last 10 messages before @
+# 2.3.0 - Daemons and Webhooks
+- Daemon checks for activity, only triggers a chat when needed
+- Daemons are far cheaper than heartbeats, no polling!
+- Webhooks trigger sapphire via GET/POST/PUT to integrate with your other systems
+- Plugin manager now has full daemon support
+- Added Telegram Plugin with daemon support to trigger chat
+- Added daemon support to email plugin
+# 2.2.9 - Metrics, Dashboard, Auto update
+- See your local usage metrics, all local
+- Dashboard page for sapphire
+- Auto Updater (required git)
+# 2.2.8 - Docker Support
+- Added Docker image to main build in github
+- One for CPU, one for Nvidia GPU
+- Faster whisper to 4 cores
+- Kokoro retry backoff for slower docker hosts
+# 2.2.7 - Plugin store
+- Sapphire can browse plugin store
+- Can install plugins
+- Authors can publish on Sapphire's Plugins
+# 2.2.6 - Bug fix + calendar
+- Fixed timezone offset issues in heartbeat (emergency patch)
+- Added Google calendar - not easy but easy as we get
+- Chat > Settings sidebar > Mind dropdown has unified structure, ready to expand
 # 2.2.5 - Toolmaker cleanup
 - It was janky
 - Single tool settings now

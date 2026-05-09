@@ -120,6 +120,9 @@ const setAvatarWithFallback = async (img, role) => {
     }
 };
 
+// Cache: persona name → resolved avatar URL (or null if no custom avatar)
+const _personaAvatarCache = new Map();
+
 const setPersonaAvatar = (img, personaName) => {
     if (!avatarsInChat) {
         img.style.display = 'none';
@@ -127,11 +130,31 @@ const setPersonaAvatar = (img, personaName) => {
     }
     img.loading = 'lazy';
 
-    // Use cached URL or build it
+    // Check cache first — avoids repeated 404s for personas without avatars
+    if (_personaAvatarCache.has(personaName)) {
+        const cached = _personaAvatarCache.get(personaName);
+        if (cached) {
+            img.src = cached;
+            img.onerror = () => { img.style.display = 'none'; };
+        } else {
+            // Cached as no custom avatar — use default
+            loadAvatarPaths().then(paths => {
+                if (paths.assistant) {
+                    img.src = paths.assistant;
+                    img.onerror = () => { img.style.display = 'none'; };
+                } else {
+                    img.style.display = 'none';
+                }
+            });
+        }
+        return;
+    }
+
     const url = `/api/personas/${encodeURIComponent(personaName)}/avatar`;
     img.src = url;
+    img.onload = () => { _personaAvatarCache.set(personaName, url); };
     img.onerror = async () => {
-        // Fall back to default assistant avatar
+        _personaAvatarCache.set(personaName, null);
         const paths = await loadAvatarPaths();
         if (paths.assistant) {
             img.src = paths.assistant;
@@ -218,15 +241,17 @@ const createMessage = (msg, idx = null, total = null, isHistoryRender = false) =
     if (role === 'assistant' && msg.metadata) {
         const meta = msg.metadata;
         const parts = [];
+        const tok = meta.tokens || {};
+        const cumTok = meta.cumulative_tokens || null;
 
         if (meta.duration_seconds) {
             parts.push(`${meta.duration_seconds}s`);
         }
         if (meta.tokens_per_second) {
-            parts.push(`${meta.tokens_per_second} tok/s`);
+            const label = tok.estimated ? 'tok/s est' : 'tok/s';
+            parts.push(`${meta.tokens_per_second} ${label}`);
         }
         if (meta.model) {
-            // Show "provider / model" when provider isn't obvious from model name
             const provider = meta.provider || '';
             const model = meta.model;
             const modelLower = model.toLowerCase();
@@ -234,15 +259,35 @@ const createMessage = (msg, idx = null, total = null, isHistoryRender = false) =
                 modelLower.startsWith(provider.toLowerCase()) ||
                 modelLower.includes(provider.toLowerCase())
             );
-            if (provider && !providerInModel) {
-                parts.push(`${provider} / ${model}`);
-            } else {
-                parts.push(model);
-            }
+            parts.push(provider && !providerInModel ? `${provider} / ${model}` : model);
+        }
+
+        // Token counts: in / out
+        const prompt = tok.prompt || 0;
+        const content = tok.content || 0;
+        if (prompt || content) {
+            const fmt = n => n >= 1000 ? `${(n/1000).toFixed(1)}k` : n;
+            parts.push(`${fmt(prompt)} in / ${fmt(content)} out`);
+        }
+
+        // Cache indicator
+        const cacheRead = tok.cache_read_tokens || 0;
+        const cacheWrite = tok.cache_write_tokens || 0;
+        if (cacheRead > 0 && prompt > 0) {
+            const pct = Math.round((cacheRead / prompt) * 100);
+            parts.push(`cache ${pct}%`);
+        } else if (cacheWrite > 0) {
+            parts.push('cache miss');
+        }
+
+        // Cumulative (multi-tool) summary
+        if (cumTok && cumTok.iterations > 1) {
+            const fmt = n => n >= 1000 ? `${(n/1000).toFixed(1)}k` : n;
+            parts.push(`${cumTok.iterations} calls · ${fmt(cumTok.total)} total`);
         }
 
         if (parts.length > 0) {
-            const metaDiv = createElem('div', { class: 'message-metadata' }, parts.join(' • '));
+            const metaDiv = createElem('div', { class: 'message-metadata' }, parts.join(' · '));
             contentDiv.appendChild(metaDiv);
         }
     }
@@ -287,6 +332,12 @@ export const renderHistory = (hist) => {
 
     hist.forEach((msg, i) => {
         if (!msg || typeof msg !== 'object') return;
+        // Strip avatar tags from history if setting is enabled
+        if (window._avatarStripTags) {
+            if (msg.content) msg.content = msg.content.replace(/<<avatar:\s*[a-zA-Z0-9_]+(?:\s+\d+(?:\.\d+)?s)?>>/g, '');
+            if (msg.parts) msg.parts = msg.parts.map(p => p.type === 'content' && p.text
+                ? { ...p, text: p.text.replace(/<<avatar:\s*[a-zA-Z0-9_]+(?:\s+\d+(?:\.\d+)?s)?>>/g, '') } : p);
+        }
         const { clone } = createMessage(msg, i, hist.length, true);
         chat.appendChild(clone);
     });
@@ -365,10 +416,21 @@ export const startTool = (toolId, toolName, args) => {
     Streaming.startTool(toolId, toolName, args, scrollToBottomIfSticky);
 };
 
-// Tool names that affect scope counts
-const GOAL_TOOLS = ['create_goal', 'update_goal', 'delete_goal'];
-const MEMORY_TOOLS = ['save_memory', 'delete_memory'];
-const KNOWLEDGE_TOOLS = ['save_person', 'save_knowledge'];
+// Map of tool name → scope keys the tool writes into. Multiple scopes possible
+// (e.g. save_person affects both knowledge and people dropdowns). When a tool
+// completes, every affected scope's sidebar dropdown gets its counts refreshed.
+// The endpoint for each refresh comes from /api/init scope_declarations, so
+// adding a new plugin scope is zero-touch on the refresh side — only this map
+// needs to know which tools affect which scopes.
+const TOOL_SCOPE_MAP = {
+    'create_goal':    ['goal'],
+    'update_goal':    ['goal'],
+    'delete_goal':    ['goal'],
+    'save_memory':    ['memory'],
+    'delete_memory':  ['memory'],
+    'save_knowledge': ['knowledge'],
+    'save_person':    ['knowledge', 'people'],
+};
 
 const refreshScopeCounts = async (selectId, apiPath) => {
     try {
@@ -385,14 +447,24 @@ const refreshScopeCounts = async (selectId, apiPath) => {
     } catch (e) { /* silent */ }
 };
 
+// Dynamic refresh dispatcher — looks up scope endpoint from /api/init declarations
+// cached by shared/init-data.js (populated on first loadSidebar).
+const refreshScopesForTool = (toolName) => {
+    const scopeKeys = TOOL_SCOPE_MAP[toolName];
+    if (!scopeKeys) return;
+    // Deferred import to avoid circular dependency at module load time
+    import('./shared/init-data.js').then(({ getInitDataSync }) => {
+        const declarations = getInitDataSync()?.scope_declarations || [];
+        for (const key of scopeKeys) {
+            const decl = declarations.find(d => d.key === key);
+            if (decl) refreshScopeCounts(`#sb-${key}-scope`, decl.endpoint);
+        }
+    }).catch(() => { /* silent */ });
+};
+
 export const endTool = (toolId, toolName, result, isError) => {
     Streaming.endTool(toolId, toolName, result, isError, scrollToBottomIfSticky);
-    if (!isError) {
-        if (GOAL_TOOLS.includes(toolName)) refreshScopeCounts('#sb-goal-scope', '/api/goals/scopes');
-        if (MEMORY_TOOLS.includes(toolName)) refreshScopeCounts('#sb-memory-scope', '/api/memory/scopes');
-        if (KNOWLEDGE_TOOLS.includes(toolName)) refreshScopeCounts('#sb-knowledge-scope', '/api/knowledge/scopes');
-        if (toolName === 'save_person') refreshScopeCounts('#sb-people-scope', '/api/knowledge/people/scopes');
-    }
+    if (!isError) refreshScopesForTool(toolName);
 };
 
 export const finishStreaming = async (ephemeral = false) => {
@@ -422,6 +494,15 @@ export const finishStreaming = async (ephemeral = false) => {
                 const hist = await api.fetchHistory();
                 if (hist && hist.length > 0) {
                     const lastMsg = hist[hist.length - 1];
+                    // Strip avatar tags from history if setting is enabled
+                    if (window._avatarStripTags && lastMsg.content) {
+                        lastMsg.content = lastMsg.content.replace(/<<avatar:\s*[a-zA-Z0-9_]+(?:\s+\d+(?:\.\d+)?s)?>>/g, '');
+                    }
+                    if (window._avatarStripTags && lastMsg.parts) {
+                        lastMsg.parts = lastMsg.parts.map(p => p.type === 'content' && p.text
+                            ? { ...p, text: p.text.replace(/<<avatar:\s*[a-zA-Z0-9_]+(?:\s+\d+(?:\.\d+)?s)?>>/g, '') }
+                            : p);
+                    }
                     const { clone } = createMessage(lastMsg, hist.length - 1, hist.length, true);
 
                     streamingMsg.replaceWith(clone);
@@ -450,9 +531,9 @@ export const hasVisibleContent = () => {
 // CHAT MANAGEMENT
 // =============================================================================
 
-export const renderChatDropdown = (chats, activeChat, storyChats = [], privateChats = []) => {
+export const renderChatDropdown = (chats, activeChat, _legacyStoryChats = [], privateChats = []) => {
     // Combine all chats for the hidden select (needs all chats for switching)
-    const allChats = [...chats, ...privateChats, ...storyChats];
+    const allChats = [...chats, ...privateChats];
 
     // Update hidden select (state holder used throughout the app)
     const select = document.getElementById('chat-select');
@@ -467,7 +548,7 @@ export const renderChatDropdown = (chats, activeChat, storyChats = [], privateCh
         });
     }
 
-    // Build picker items — regular chats, then private, then story
+    // Build picker items — regular chats, then private
     let itemsHtml = chats.map(c => `
         <button class="chat-picker-item ${c.name === activeChat ? 'active' : ''}"
                 data-chat="${c.name}">
@@ -487,23 +568,11 @@ export const renderChatDropdown = (chats, activeChat, storyChats = [], privateCh
         `).join('');
     }
 
-    if (storyChats.length > 0) {
-        itemsHtml += '<div class="chat-picker-divider"></div>';
-        itemsHtml += storyChats.map(c => `
-            <button class="chat-picker-item chat-picker-story ${c.name === activeChat ? 'active' : ''}"
-                    data-chat="${c.name}">
-                <span class="chat-picker-item-check">${c.name === activeChat ? '\u2713' : ''}</span>
-                <span class="chat-picker-item-name">${escapeHtml(c.display_name)}</span>
-            </button>
-        `).join('');
-    }
-
     // Action buttons at the bottom
     itemsHtml += '<div class="chat-picker-divider"></div>';
     if (!window.__managed) {
         itemsHtml += '<button class="chat-picker-story-btn" data-action="new-private">&#x1F512; New Private...</button>';
     }
-    itemsHtml += '<button class="chat-picker-story-btn" data-action="new-story">&#x1F4D6; New Story...</button>';
 
     // Update sidebar chat picker dropdown
     const sbDropdown = document.getElementById('sb-chat-picker-dropdown');

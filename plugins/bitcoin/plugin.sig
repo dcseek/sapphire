@@ -1,11 +1,11 @@
 {
   "plugin": "bitcoin",
   "version": "1.0.0",
-  "signed_at": "2026-03-07T19:22:48.685167+00:00",
   "files": {
-    "plugin.json": "sha256:c1fba18c01f7ffe19d75a33ed75469303462d2ee5ce792903c8c34c42995993b",
+    "README.md": "sha256:e548bced6f5a560235a68fc1c70741bfc59a1daa7c2b90a6f9ff5bac0c380b18",
+    "plugin.json": "sha256:b1db7fb6d564a12e17edb9628c4a5057d3cc8b67ed6facaab8eb043405c6e69a",
     "tools/bitcoin_tool.py": "sha256:d97a9710d5510717e8edbebd2fa9e390ac6230440fe03dc2c06d652e540af353",
-    "web/index.js": "sha256:caeca523159e4219240b4e2035b2bcd0b1e242534ae89bddf98b030a17487314"
+    "web/index.js": "sha256:630262d81c971d4a386dd4e51387265e3ba4dfc9d52387d0eee11b1cb82468cb"
   },
-  "signature": "kvPfQZAKp/KcXVdCTA8EuRZF2gbALeeCN7uUmv86UiKJa5UuK5NXzh3dCv0oVqm9BoC4Zxvov2GO9sRBJIKIDA=="
+  "signature": "oGS2lBw1DGnCDEosyKt5IaoscHj3iUJVjqlqlm6a2Ira6TBPE04RZbibRfXsN9nh8VV5rNKPQEu1B1yZE2BUDw=="
 }

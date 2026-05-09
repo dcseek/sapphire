@@ -5,6 +5,7 @@ import * as audio from '../audio.js';
 import * as chat from '../chat.js';
 import * as Images from '../ui-images.js';
 import { isPrivacyMode } from '../features/privacy.js';
+import { dispatch, Events } from '../core/event-bus.js';
 import {
     getElements,
     getIsProc,
@@ -30,10 +31,12 @@ export async function handleSend() {
         return;
     }
 
+    dispatch(Events.USER_SENT, { text: txt });
+
     const abortController = new AbortController();
     setAbortController(abortController);
     setIsCancelling(false);
-    
+
     setProc(true);
     input.value = '';
     sendBtn.disabled = true;
@@ -57,7 +60,7 @@ export async function handleSend() {
     try {
         let streamOk = false;
         const audioFn = getTtsEnabled() ? audio.playText : null;
-        
+
         await api.streamChat(
             txt,
             chunk => {
@@ -357,18 +360,26 @@ export async function handleStop() {
 export async function triggerSendWithText(text) {
     if (getIsProc()) {
         console.log('Already processing, ignoring transcribed text');
-        return;
+        return false;
     }
-    
+
     const { input } = getElements();
     input.value = text;
     input.dispatchEvent(new Event('input'));
     await handleSend();
+    return true;
 }
 
+let _userTypingTimer = null;
 export function handleInput() {
     const { input } = getElements();
     input.parentElement.dataset.replicatedValue = input.value;
+    // Debounced user_typing event for avatar (fire once, not per keystroke)
+    if (!_userTypingTimer && input.value.trim()) {
+        dispatch(Events.USER_TYPING);
+    }
+    clearTimeout(_userTypingTimer);
+    _userTypingTimer = setTimeout(() => { _userTypingTimer = null; }, 2000);
 }
 
 export function handleKeyDown(e) {

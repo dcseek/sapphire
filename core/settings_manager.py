@@ -25,7 +25,7 @@ class SettingsManager:
         self._config = {}
         self._runtime = {}  # Non-persisted runtime overrides (survive file reload)
         self._reload_callbacks = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         
         # File watcher state
         self._watcher_thread = None
@@ -67,7 +67,7 @@ class SettingsManager:
         config_objects = {
             'LLM_PRIMARY', 'LLM_FALLBACK', 'GENERATION_DEFAULTS',
             'FASTER_WHISPER_VAD_PARAMETERS', 'LLM_PROVIDERS',
-            'MODEL_GENERATION_PROFILES'
+            'LLM_CUSTOM_PROVIDERS', 'MODEL_GENERATION_PROFILES'
         }
         return key in config_objects
     
@@ -129,24 +129,100 @@ class SettingsManager:
             logger.info("No user settings found, using defaults")
             self._user = {}
     
+    def _migrate_providers(self):
+        """Migrate non-core providers from LLM_PROVIDERS to LLM_CUSTOM_PROVIDERS.
+
+        Writes directly to the nested JSON file to ensure keys are actually removed
+        from LLM_PROVIDERS (not re-merged by save's deep-update). Only runs if
+        non-core keys are found in LLM_PROVIDERS.
+        """
+        if 'LLM_PROVIDERS' not in self._user:
+            return
+        providers = self._user.get('LLM_PROVIDERS', {})
+        if not isinstance(providers, dict):
+            return
+
+        core_keys = {'claude', 'openai', 'gemini'}
+        non_core = [k for k in providers if k not in core_keys]
+        if not non_core:
+            return  # Nothing to migrate — skip entirely
+
+        custom = self._user.get('LLM_CUSTOM_PROVIDERS', {})
+        template_map = {
+            'fireworks': 'openai', 'openai': 'openai', 'claude': 'claude',
+            'anthropic': 'anthropic', 'responses': 'responses',
+            'gemini': 'gemini',
+        }
+
+        for key in non_core:
+            config = providers.pop(key)
+            ptype = config.get('provider', 'openai')
+            config['template'] = template_map.get(ptype, 'openai')
+            config.setdefault('display_name', config.get('display_name', key))
+            if key in ('other', 'responses') and not config.get('base_url'):
+                continue
+            custom[key] = config
+
+        self._user['LLM_PROVIDERS'] = providers
+        self._user['LLM_CUSTOM_PROVIDERS'] = custom
+        logger.info(f"[SETTINGS] Migrated {len(non_core)} providers to LLM_CUSTOM_PROVIDERS")
+
+        # Write directly to the nested file to ensure keys are REMOVED, not re-merged.
+        # save()'s _deep_update_from_flat doesn't delete keys — it only adds/overwrites.
+        user_path = self.BASE_DIR / 'user' / 'settings.json'
+        try:
+            with open(user_path, 'r', encoding='utf-8') as f:
+                nested = json.load(f)
+            llm = nested.get('llm', {})
+            if isinstance(llm.get('LLM_PROVIDERS'), dict):
+                for k in non_core:
+                    llm['LLM_PROVIDERS'].pop(k, None)
+            llm['LLM_CUSTOM_PROVIDERS'] = custom
+            nested['llm'] = llm
+            tmp_path = user_path.with_suffix('.json.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(nested, f, indent=2)
+            tmp_path.replace(user_path)
+            # Update mtime immediately — no gap for file watcher
+            self._last_mtime = user_path.stat().st_mtime
+            logger.info(f"[SETTINGS] Migration persisted to disk")
+        except Exception as e:
+            logger.error(f"[SETTINGS] Failed to persist migration: {e}")
+
     def _merge_settings(self):
         """Merge defaults with user overrides, deep-merging LLM_PROVIDERS"""
+        # Run migration before merge
+        self._migrate_providers()
+
         self._config = {**self._defaults, **self._user}
 
-        # Deep-merge LLM_PROVIDERS so new provider fields from defaults aren't lost
+        # Deep-merge LLM_PROVIDERS (core) so new provider fields from defaults aren't lost
         if 'LLM_PROVIDERS' in self._defaults and 'LLM_PROVIDERS' in self._user:
             merged_providers = {}
             for key, default_config in self._defaults['LLM_PROVIDERS'].items():
                 if key in self._user['LLM_PROVIDERS']:
-                    # Merge: defaults first, then user overrides
                     merged_providers[key] = {**default_config, **self._user['LLM_PROVIDERS'][key]}
                 else:
                     merged_providers[key] = default_config
-            # Include any user-added providers not in defaults
+            # Include any user-added core providers not in defaults (shouldn't happen but safe)
             for key, user_config in self._user['LLM_PROVIDERS'].items():
                 if key not in merged_providers:
                     merged_providers[key] = user_config
             self._config['LLM_PROVIDERS'] = merged_providers
+
+        # Deep-merge LLM_CUSTOM_PROVIDERS — defaults + user
+        default_custom = self._defaults.get('LLM_CUSTOM_PROVIDERS', {})
+        user_custom = self._user.get('LLM_CUSTOM_PROVIDERS', {})
+        merged_custom = {}
+        for key, default_config in default_custom.items():
+            if key in user_custom:
+                merged_custom[key] = {**default_config, **user_custom[key]}
+            else:
+                merged_custom[key] = default_config
+        for key, user_config in user_custom.items():
+            if key not in merged_custom:
+                merged_custom[key] = user_config
+        self._config['LLM_CUSTOM_PROVIDERS'] = merged_custom
 
         # Deep-merge MODEL_GENERATION_PROFILES so new model profiles from defaults aren't lost
         if 'MODEL_GENERATION_PROFILES' in self._defaults and 'MODEL_GENERATION_PROFILES' in self._user:
@@ -220,9 +296,15 @@ class SettingsManager:
                 logger.error(f"Failed to create example file: {e}")
     
     def get(self, key, default=None):
-        """Get a setting value"""
+        """Get a setting value (returns copies of mutable types to prevent reference leaks)"""
         with self._lock:
-            return self._config.get(key, default)
+            val = self._config.get(key, default)
+            if isinstance(val, dict):
+                import copy
+                return copy.deepcopy(val)
+            if isinstance(val, list):
+                return val.copy()
+            return val
     
     # Settings locked in managed mode (env var only)
     MANAGED_LOCKED_KEYS = {
@@ -235,6 +317,9 @@ class SettingsManager:
 
     def is_managed(self):
         return bool(os.environ.get('SAPPHIRE_MANAGED'))
+
+    def is_docker(self):
+        return bool(os.environ.get('SAPPHIRE_DOCKER'))
 
     def is_unrestricted(self):
         return bool(os.environ.get('SAPPHIRE_UNRESTRICTED'))
@@ -291,12 +376,13 @@ class SettingsManager:
         """Set multiple settings at once"""
         for key, value in settings_dict.items():
             self.set(key, value, persist=False)  # Don't save each individually
-        
+
         if persist:
-            self._user.update(settings_dict)
-            for key in settings_dict:
-                self._runtime.pop(key, None)  # Now persisted
-            self.save()
+            with self._lock:
+                self._user.update(settings_dict)
+                for key in settings_dict:
+                    self._runtime.pop(key, None)  # Now persisted
+                self.save()
 
             # Track which settings require restart
             if hasattr(self, '_pending_restart_keys'):
@@ -342,8 +428,9 @@ class SettingsManager:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(nested, f, indent=2)
             tmp_path.replace(user_path)
-
-            self._update_mtime()
+            # Update mtime IMMEDIATELY after rename — no gap for the file watcher
+            # to see a new mtime before _last_mtime is updated (fixes spurious reloads)
+            self._last_mtime = user_path.stat().st_mtime
             logger.info(f"Saved user settings to {user_path}")
             return True
         except Exception as e:
@@ -416,19 +503,15 @@ class SettingsManager:
             self._runtime = {}  # Clear runtime overrides too
             self._merge_settings()
             
-            # Actually delete/recreate the settings file
+            # Atomically replace the settings file
             user_path = self.BASE_DIR / 'user' / 'settings.json'
             try:
-                if user_path.exists():
-                    user_path.unlink()
-                    logger.info(f"Deleted user settings file: {user_path}")
-                
-                # Write minimal fresh file
                 user_path.parent.mkdir(exist_ok=True)
-                with open(user_path, 'w', encoding='utf-8') as f:
+                tmp_path = user_path.with_suffix('.json.tmp')
+                with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump({"_comment": "Your custom settings - edit freely or use web UI"}, f, indent=2)
-                
-                self._update_mtime()
+                tmp_path.replace(user_path)
+                self._last_mtime = user_path.stat().st_mtime
                 logger.info("Settings reset to defaults")
                 return True
             except Exception as e:
@@ -542,7 +625,7 @@ class SettingsManager:
             'LLM_MAX_HISTORY', 'CONTEXT_LIMIT',
             'FORCE_THINKING', 'THINKING_PREFILL',
             'CLAUDE_THINKING_ENABLED', 'CLAUDE_THINKING_BUDGET',
-            'LLM_PROVIDERS', 'LLM_FALLBACK_ORDER', 'LLM_REQUEST_TIMEOUT',
+            'LLM_PROVIDERS', 'LLM_CUSTOM_PROVIDERS', 'LLM_FALLBACK_ORDER', 'LLM_REQUEST_TIMEOUT',
             # SOCKS can be hot-reloaded - session cache is cleared on change
             'SOCKS_ENABLED', 'SOCKS_HOST', 'SOCKS_PORT', 'SOCKS_TIMEOUT',
             # Privacy mode is runtime-only, always hot
@@ -595,26 +678,32 @@ class SettingsManager:
         """Background thread that watches for file changes"""
         user_path = self.BASE_DIR / 'user' / 'settings.json'
         logger.info("File watcher started")
-        
+
         while self._watcher_running:
             try:
                 time.sleep(2)  # Poll every 2 seconds
-                
+
                 if not user_path.exists():
                     continue
-                
+
                 current_mtime = user_path.stat().st_mtime
-                
-                # Check if file was modified
+
+                # Check if file was modified externally (not by our own save/migration)
                 if self._last_mtime is not None and current_mtime != self._last_mtime:
                     # Debounce: wait 0.5s to ensure file write is complete
                     now = time.time()
                     if now - self._last_check < 0.5:
                         continue
-                    
+
                     self._last_check = now
                     time.sleep(0.5)
-                    
+
+                    # Re-check mtime after debounce — our own save() may have
+                    # updated _last_mtime during the sleep, meaning WE wrote
+                    # the file, not an external editor.
+                    if user_path.stat().st_mtime == self._last_mtime:
+                        continue
+
                     # Reload settings
                     logger.info("Detected settings file change, reloading...")
                     self.reload()
@@ -697,7 +786,7 @@ class SettingsManager:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(nested, f, indent=2)
                 tmp_path.replace(user_path)
-                self._update_mtime()
+                self._last_mtime = user_path.stat().st_mtime
                 logger.debug(f"Removed '{key}' from settings file")
         except Exception as e:
             logger.error(f"Failed to remove key from file: {e}")

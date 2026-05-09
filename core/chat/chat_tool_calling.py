@@ -105,11 +105,15 @@ def _extract_tool_images(result, history=None):
             if isinstance(img, dict) and img.get("data")
         ]
         # Save images to DB and embed markers in text
+        # Images with display_only=True are saved for user gallery but not sent to LLM
+        llm_images = []
         for img in images:
             img_id = _save_tool_image(img, history)
             if img_id:
                 text = f"<<IMG::tool:{img_id}>>\n{text}"
-        return text, images
+            if not img.get("display_only"):
+                llm_images.append(img)
+        return text, llm_images
     return str(result), []
 
 
@@ -156,13 +160,26 @@ class ToolCallingEngine:
         
         elapsed = time.time() - start_time
         
-        # Log performance
+        # Log performance + diagnostic trinity (finish_reason, reasoning tokens).
+        # Without these, "short response + fast t/s" is ambiguous — could be
+        # the model legitimately stopping, could be hitting max_tokens, could
+        # be reasoning tokens eating budget invisibly. 2026-04-24.
         try:
-            if response.usage and response.usage.get('completion_tokens'):
-                tps = response.usage['completion_tokens'] / elapsed
-                logger.info(f"LLM ({provider.model}): {elapsed:.2f}s, {len(str(response.content))} chars, {tps:.1f} t/s")
+            usage = response.usage or {}
+            finish = getattr(response, 'finish_reason', None) or '?'
+            reasoning_tok = usage.get('reasoning_tokens', 0)
+            content_chars = len(str(response.content)) if response.content else 0
+            if usage.get('completion_tokens'):
+                tps = usage['completion_tokens'] / elapsed
+                logger.info(
+                    f"LLM ({provider.model}): {elapsed:.2f}s, {content_chars} chars, "
+                    f"{tps:.1f} t/s, finish={finish}, reasoning_tok={reasoning_tok}"
+                )
             else:
-                logger.info(f"LLM ({provider.model}): {elapsed:.2f}s, {len(str(response.content))} chars")
+                logger.info(
+                    f"LLM ({provider.model}): {elapsed:.2f}s, {content_chars} chars, "
+                    f"finish={finish}"
+                )
         except (AttributeError, ZeroDivisionError, TypeError):
             pass
         
@@ -265,7 +282,7 @@ class ToolCallingEngine:
             })
         return tool_calls_formatted
 
-    def execute_tool_calls(self, tool_calls, messages, history, provider: BaseProvider = None, scopes=None):
+    def execute_tool_calls(self, tool_calls, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None):
         """
         Execute tool calls and add results to messages array AND history.
 
@@ -304,7 +321,7 @@ class ToolCallingEngine:
                 continue
 
             try:
-                function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes)
+                function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools)
             except Exception as tool_error:
                 logger.error(f"Tool execution failed for {function_name}: {tool_error}", exc_info=True)
                 function_result = f"Tool '{function_name}' failed: {str(tool_error)}"
@@ -338,7 +355,7 @@ class ToolCallingEngine:
 
         return tools_executed, tool_images
 
-    def execute_text_based_tool_call(self, function_call_data, filtered_content, messages, history, provider: BaseProvider = None, scopes=None):
+    def execute_text_based_tool_call(self, function_call_data, filtered_content, messages, history, provider: BaseProvider = None, scopes=None, allowed_tools=None):
         """
         Execute text-based function call (LM Studio compatibility).
         
@@ -355,12 +372,21 @@ class ToolCallingEngine:
         function_name = function_call_data["function_call"]["name"]
         function_args = function_call_data["function_call"]["arguments"]
 
+        # Some text-based-tool-call providers deliver `arguments` as an already-
+        # JSON-encoded string; others as a dict. json.dumps on a string would
+        # double-encode (writes `"\"{...}\""` to history), bricking the chat
+        # for strict providers on the next turn. Honor whatever the LLM gave us.
+        if isinstance(function_args, str):
+            args_json = function_args
+        else:
+            args_json = json.dumps(function_args)
+
         tool_calls_formatted = [{
             "id": tool_call_id,
             "type": "function",
             "function": {
                 "name": function_name,
-                "arguments": json.dumps(function_args)
+                "arguments": args_json
             }
         }]
         
@@ -374,7 +400,7 @@ class ToolCallingEngine:
             history.add_assistant_with_tool_calls(filtered_content, tool_calls_formatted)
 
         try:
-            function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes)
+            function_result = self.function_manager.execute_function(function_name, function_args, scopes=scopes, allowed_tools=allowed_tools)
         except Exception as tool_error:
             logger.error(f"Text-based tool failed for {function_name}: {tool_error}")
             function_result = f"Tool '{function_name}' failed: {str(tool_error)}"

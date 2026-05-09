@@ -1,8 +1,7 @@
-// features/scene.js - Scene state polling, LLM indicator, spice/story status
+// features/scene.js - Scene state polling, LLM indicator, spice status
 import * as api from '../api.js';
 import * as audio from '../audio.js';
 import { getElements, setTtsEnabled, setSttEnabled, setSttReady, setPromptPrivacyRequired } from '../core/state.js';
-import { updateStoryIndicator } from './story.js';
 
 // Call this when chat's primary LLM is known (from chat-manager, chat-settings)
 export function updateSendButtonLLM(primary, model = '') {
@@ -14,14 +13,15 @@ export function updateSendButtonLLM(primary, model = '') {
     sendBtn.classList.remove('llm-local', 'llm-cloud', 'llm-auto');
     if (indicator) indicator.classList.remove('cloud');
 
-    // Cloud providers
-    const cloudProviders = ['claude', 'openai', 'fireworks', 'other'];
-    const isCloud = cloudProviders.includes(primary);
+    // Detect local vs cloud — local providers have local URLs (localhost, 127.0.0.1)
+    // Default to cloud for any named provider that isn't obviously local
+    const localPatterns = ['lmstudio', 'ollama'];
+    const isLocal = localPatterns.includes(primary) || primary === 'none';
+    const isCloud = !isLocal && primary !== 'auto';
 
-    // Build display name - capitalize first letter
-    const displayName = primary === 'lmstudio' ? 'LM Studio' :
-                       primary === 'none' ? 'Off' :
-                       primary ? primary.charAt(0).toUpperCase() + primary.slice(1) : 'Local';
+    // Build display name
+    const displayName = primary === 'none' ? 'Off' :
+                       primary ? primary.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'Local';
 
     // Build title suffix for model
     const modelSuffix = model ? ` (${model.split('/').pop()})` : '';
@@ -80,7 +80,6 @@ export async function updateScene() {
         audio.setLocalTtsPlaying(status?.tts_playing || false);
 
         setPromptPrivacyRequired(status?.prompt_privacy_required || false);
-        updateStoryIndicator(status?.story);
 
         return status;
     } catch {

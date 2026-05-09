@@ -146,7 +146,7 @@ export function off(eventType, handler) {
 /**
  * Dispatch an event to all registered handlers
  */
-function dispatch(eventType, data, timestamp) {
+export function dispatch(eventType, data, timestamp) {
     const set = handlers.get(eventType);
     if (set) {
         for (const handler of set) {
@@ -195,6 +195,7 @@ export const Events = {
     MESSAGE_ADDED: 'message_added',
     MESSAGE_REMOVED: 'message_removed',
     CHAT_SWITCHED: 'chat_switched',
+    CHAT_CREATED: 'chat_created',
     CHAT_CLEARED: 'chat_cleared',
     
     // TTS events
@@ -240,6 +241,25 @@ export const Events = {
 
     // Plugin events
     PLUGIN_RELOADED: 'plugin_reloaded',
+    PLUGIN_LOAD_ERROR: 'plugin_load_error',
+
+    // Mind data changed — tool or UI wrote to memory/goal/knowledge/people.
+    // Payload: {domain, scope, action}. Mind view uses it to live-refresh.
+    MIND_CHANGED: 'mind_changed',
+
+    // Re-embed pipeline progress. Payload = full status snapshot from the
+    // worker (running, total, done, current_table, errors, last_error).
+    REEMBED_PROGRESS: 'reembed_progress',
+
+    // Agent events
+    AGENT_SPAWNED: 'agent_spawned',
+    AGENT_COMPLETED: 'agent_completed',
+    AGENT_DISMISSED: 'agent_dismissed',
+
+    // User interaction events (avatar state triggers + overlay)
+    USER_TYPING: 'user_typing',       // User is typing in chat input
+    USER_SENT: 'user_sent',           // User sent a message — data: {text}
+    CHAT_CHUNK: 'chat_chunk',         // AI streaming text chunk — data: {text}
 
     // Connection events
     CONNECTED: 'connected',           // Server confirms SSE subscription

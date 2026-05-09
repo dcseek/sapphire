@@ -11,6 +11,49 @@ from core.event_bus import publish, Events
 logger = logging.getLogger(__name__)
 
 
+# Whisper frequently hallucinates these canned phrases on silence/noise/
+# off-language input (trained heavily on YouTube captions). Filtering them
+# prevents phantom LLM calls after wakeword false-positives. Case-
+# insensitive exact-match after strip + punctuation normalization.
+_WHISPER_HALLUCINATIONS = {
+    'thank you',
+    'thanks for watching',
+    'thanks for watching!',
+    'thanks for watching.',
+    'you',
+    '.',
+    'bye',
+    'bye.',
+    'bye!',
+    'goodbye',
+    'goodbye.',
+    "i'm sorry",
+    "i'm sorry.",
+    'subtitles by',
+    '[music]',
+    '[laughter]',
+    '[applause]',
+    'thanks.',
+    'thank you.',
+    'okay.',
+    'ok.',
+}
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """Return True if `text` matches a known Whisper hallucination phrase
+    (or is empty/whitespace — same downstream treatment)."""
+    if not text:
+        return True
+    normalized = text.strip().lower()
+    if not normalized:
+        return True
+    if normalized in _WHISPER_HALLUCINATIONS:
+        return True
+    stripped = normalized.rstrip('.!?').strip()
+    return stripped in _WHISPER_HALLUCINATIONS
+
+
 class WakeWordDetector:
     def __init__(self, model_name=None):
         """Initialize OpenWakeWord detector.
@@ -56,6 +99,7 @@ class WakeWordDetector:
         
         # Output device setup for tone playback
         self.output_device = None
+        self.output_device_name = None
         self.output_rate = None
         self.tone_available = False
         self._init_output_device()
@@ -70,43 +114,31 @@ class WakeWordDetector:
         self.playback_lock = threading.Lock()
 
     def _init_output_device(self):
-        """Find a working output device for tone playback."""
+        """Find a working output device via DeviceManager (respects AUDIO_OUTPUT_DEVICE setting)."""
+        self.tone_available = False
         try:
-            devices = sd.query_devices()
-        except Exception as e:
-            logger.error(f"Failed to query audio devices for tone: {e}")
-            return
-        
-        # Build list of output devices
-        output_devices = []
-        for i, dev in enumerate(devices):
-            if dev['max_output_channels'] > 0:
-                logger.debug(f"Found output device {i}: {dev['name']} "
-                           f"(default_rate={dev['default_samplerate']})")
-                output_devices.append((i, dev))
-        
-        if not output_devices:
-            logger.warning("No output devices found - wake tone disabled")
-            return
-        
-        # Try default device first
-        try:
-            default_out = sd.default.device[1]
-            if default_out is not None:
-                for idx, dev_info in output_devices:
-                    if idx == default_out:
-                        if self._try_output_device(idx, dev_info):
-                            return
-                        break
-        except Exception:
-            pass
-        
-        # Fall back to any available device
-        for idx, dev_info in output_devices:
-            if self._try_output_device(idx, dev_info):
+            from core.audio import get_device_manager
+            dm = get_device_manager()
+            dev_idx, default_rate, dev_name = dm.find_output_device()
+            if dev_idx is None:
+                logger.warning("No output devices found - wake tone disabled")
                 return
-        
-        logger.warning("No compatible output device found - wake tone disabled")
+
+            dev_info = {'name': dev_name, 'default_samplerate': default_rate}
+            if self._try_output_device(dev_idx, dev_info):
+                self.output_device_name = dev_name
+                return
+
+            logger.warning(f"Output device '{dev_name}' failed, trying all outputs")
+            for dev in dm.get_output_devices():
+                info = {'name': dev.name, 'default_samplerate': dev.default_samplerate}
+                if self._try_output_device(dev.index, info):
+                    self.output_device_name = dev.name
+                    return
+
+            logger.warning("No compatible output device found - wake tone disabled")
+        except Exception as e:
+            logger.error(f"Output device init failed: {e}")
 
     def _try_output_device(self, device_index, dev_info):
         """Try to use an output device, testing sample rates."""
@@ -174,11 +206,19 @@ class WakeWordDetector:
         """Play wake acknowledgment tone using sounddevice's built-in playback."""
         if not self.tone_available or self.tone_data is None:
             return
-        
+
         with self.playback_lock:
             try:
                 sd.play(self.tone_data, self.tone_sample_rate, device=self.output_device)
-                # Don't wait - let it play async
+            except sd.PortAudioError as pa_err:
+                logger.warning(f"Tone output device {self.output_device} failed: {pa_err} — re-probing")
+                self._init_output_device()
+                if self.tone_available:
+                    self._generate_tone()
+                    try:
+                        sd.play(self.tone_data, self.tone_sample_rate, device=self.output_device)
+                    except Exception as e2:
+                        logger.debug(f"Tone playback retry failed: {e2}")
             except Exception as e:
                 logger.debug(f"Tone playback error: {e}")
 
@@ -280,6 +320,16 @@ class WakeWordDetector:
                 self.system.speak_error('speech')
                 return
 
+            # Whisper hallucination filter. On silence or noise after a
+            # wakeword false-positive, Whisper famously produces canned
+            # phrases (trained on YouTube captions). Without this filter,
+            # the user wakes to Sapphire replying to phantom input at 3am.
+            # Scout 4 finding (2026-04-19).
+            if _is_whisper_hallucination(text):
+                logger.warning(f"Whisper hallucination filtered: {text!r}")
+                self.system.speak_error('speech')
+                return
+
             # post_stt hook — plugins can correct/translate/normalize transcription
             from core.hooks import hook_runner, HookEvent
             if hook_runner.has_handlers("post_stt"):
@@ -306,8 +356,8 @@ class WakeWordDetector:
             except Exception:
                 pass
 
-            # Restart wakeword audio stream after TTS is done
-            if self.audio_recorder:
+            # Restart wakeword audio stream after TTS is done (only if still enabled)
+            if self.audio_recorder and self.running:
                 logger.debug("Restarting wakeword audio stream after STT/TTS")
                 self.audio_recorder.start_recording()
 
@@ -369,13 +419,40 @@ class WakeWordDetector:
                         self.audio_recorder.stop_recording()
                         time.sleep(1)
                         self.audio_recorder.start_recording()
+                        # Verify recovery actually succeeded — start_recording
+                        # swallows exceptions and leaves stream=None on failure.
+                        # Without this check, the loop keeps polling a None
+                        # stream forever and the user thinks wakeword is up
+                        # when it's silently dead. Scout 4 finding (2026-04-19).
+                        if self.audio_recorder.get_stream() is None:
+                            raise RuntimeError("start_recording returned but stream is None")
                         logger.info("Attempted stream recovery after persistent errors")
                         consecutive_errors = 0
                     except Exception as recovery_err:
                         logger.error(f"Stream recovery failed: {recovery_err}")
-                        time.sleep(5)
+                        # Publish a CONTINUITY_TASK_ERROR so the UI surfaces
+                        # "wakeword is silently dead." Otherwise the UI toggle
+                        # still reads on, but Sapphire can't hear.
+                        try:
+                            from core.event_bus import publish, Events
+                            publish(Events.CONTINUITY_TASK_ERROR, {
+                                "task": "Wake Word",
+                                "error": f"Wake word stream recovery failed ({type(recovery_err).__name__}: "
+                                         f"{recovery_err}). Audio input is dead — check mic, restart "
+                                         f"Sapphire, or toggle wake word off/on.",
+                            })
+                        except Exception:
+                            pass
+                        # Stop the loop rather than spin forever on a dead
+                        # stream. UI state will follow once the loop exits.
+                        self.running = False
+                        break
 
     def start_listening(self):
+        if self.running:
+            logger.warning("Wake detector already listening — skipping duplicate start")
+            return
+
         if not self.audio_recorder:
             logger.error("No audio recorder set")
             raise ValueError("No audio recorder set")

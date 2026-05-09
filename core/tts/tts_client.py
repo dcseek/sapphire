@@ -48,6 +48,7 @@ class TTSClient:
         
         # Audio output device setup
         self.output_device = None
+        self.output_device_name = None
         self.output_rate = None
         self.audio_available = False
         self._init_output_device()
@@ -62,43 +63,33 @@ class TTSClient:
             logger.warning("Audio playback unavailable - TTS will be silent")
     
     def _init_output_device(self):
-        """Find a working output device and compatible sample rate."""
+        """Find a working output device via DeviceManager (respects AUDIO_OUTPUT_DEVICE setting)."""
+        self.audio_available = False
         try:
-            devices = sd.query_devices()
-        except Exception as e:
-            logger.error(f"Failed to query audio devices: {e}")
-            return
-        
-        # Build list of output devices
-        output_devices = []
-        for i, dev in enumerate(devices):
-            if dev['max_output_channels'] > 0:
-                logger.debug(f"Found output device {i}: {dev['name']} "
-                           f"(default_rate={dev['default_samplerate']})")
-                output_devices.append((i, dev))
-        
-        if not output_devices:
-            logger.error("No output devices found")
-            return
-        
-        # Try default device first
-        try:
-            default_out = sd.default.device[1]
-            if default_out is not None:
-                for idx, dev_info in output_devices:
-                    if idx == default_out:
-                        if self._try_output_device(idx, dev_info):
-                            return
-                        break
-        except Exception:
-            pass
-        
-        # Fall back to any available device
-        for idx, dev_info in output_devices:
-            if self._try_output_device(idx, dev_info):
+            from core.audio import get_device_manager
+            dm = get_device_manager()
+            dev_idx, default_rate, dev_name = dm.find_output_device()
+            if dev_idx is None:
+                logger.error("No output devices found")
                 return
-        
-        logger.error("No compatible output device found")
+
+            # Test sample rates on the resolved device
+            dev_info = {'name': dev_name, 'default_samplerate': default_rate}
+            if self._try_output_device(dev_idx, dev_info):
+                self.output_device_name = dev_name
+                return
+
+            # If configured device fails, fall back to any working output
+            logger.warning(f"Output device '{dev_name}' failed, trying all outputs")
+            for dev in dm.get_output_devices():
+                info = {'name': dev.name, 'default_samplerate': dev.default_samplerate}
+                if self._try_output_device(dev.index, info):
+                    self.output_device_name = dev.name
+                    return
+
+            logger.error("No compatible output device found")
+        except Exception as e:
+            logger.error(f"Output device init failed: {e}")
 
     def _try_output_device(self, device_index, dev_info):
         """Try to use an output device, testing sample rates.
@@ -250,7 +241,8 @@ class TTSClient:
         # pre_tts hook — plugins can alter or cancel TTS
         from core.hooks import hook_runner, HookEvent
         if hook_runner.has_handlers("pre_tts"):
-            tts_event = HookEvent(tts_text=processed_text, config=config)
+            tts_event = HookEvent(tts_text=processed_text, config=config,
+                                  metadata={'tts_client': self})
             hook_runner.fire("pre_tts", tts_event)
             if tts_event.skip_tts:
                 return False
@@ -283,7 +275,8 @@ class TTSClient:
         # pre_tts hook — plugins can alter or cancel TTS
         from core.hooks import hook_runner, HookEvent
         if hook_runner.has_handlers("pre_tts"):
-            tts_event = HookEvent(tts_text=processed_text, config=config)
+            tts_event = HookEvent(tts_text=processed_text, config=config,
+                                  metadata={'tts_client': self})
             hook_runner.fire("pre_tts", tts_event)
             if tts_event.skip_tts:
                 return False
@@ -330,8 +323,10 @@ class TTSClient:
             if not audio_bytes:
                 return None, None
 
-            # Save to temp file for soundfile to read (all providers return OGG/Opus)
-            fd, temp_path = tempfile.mkstemp(suffix='.ogg', dir=self.temp_dir)
+            # Save to temp file for soundfile to read
+            ext_map = {'audio/mp3': '.mp3', 'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/ogg': '.ogg'}
+            ext = ext_map.get(self._provider.audio_content_type, '.ogg')
+            fd, temp_path = tempfile.mkstemp(suffix=ext, dir=self.temp_dir)
             os.close(fd)
 
             with open(temp_path, 'wb') as f:
@@ -411,15 +406,31 @@ class TTSClient:
             chunks_written = 0
             stopped_early = False
 
-            with sd.OutputStream(samplerate=samplerate, device=self.output_device,
-                                 channels=1, dtype='float32') as stream:
-                for i in range(0, len(audio_data), chunk_size):
-                    if self.should_stop.is_set() or _stale():
-                        stopped_early = True
-                        break
-                    chunk = audio_data[i:i + chunk_size].reshape(-1, 1)
-                    stream.write(chunk)
-                    chunks_written += 1
+            def _play_stream():
+                nonlocal chunks_written, stopped_early
+                with sd.OutputStream(samplerate=samplerate, device=self.output_device,
+                                     channels=1, dtype='float32') as stream:
+                    for i in range(0, len(audio_data), chunk_size):
+                        if self.should_stop.is_set() or _stale():
+                            stopped_early = True
+                            break
+                        chunk = audio_data[i:i + chunk_size].reshape(-1, 1)
+                        stream.write(chunk)
+                        chunks_written += 1
+
+            try:
+                _play_stream()
+            except sd.PortAudioError as pa_err:
+                logger.warning(f"[TTS] Output device {self.output_device} failed: {pa_err} — re-probing")
+                self._init_output_device()
+                if self.audio_available:
+                    if samplerate != self.output_rate:
+                        audio_data = self._resample(audio_data, samplerate, self.output_rate)
+                        samplerate = self.output_rate
+                        chunk_size = int(samplerate * chunk_dur)
+                    _play_stream()
+                else:
+                    raise
 
             if stopped_early:
                 logger.info(f"[TTS] Stopped early at {chunks_written * chunk_dur:.1f}s / {duration:.1f}s")
@@ -438,13 +449,16 @@ class TTSClient:
             logger.error(f"Error in TTS playback: {e}", exc_info=True)
         finally:
             with self.lock:
+                was_playing = self._is_playing
                 self._is_playing = False
+            if was_playing:
                 publish(Events.TTS_STOPPED)
             gc.collect()
 
     def stop(self):
         """Stop currently playing audio"""
         self.should_stop.set()
+        was_playing = False
         with self.lock:
             if self._is_playing:
                 try:
@@ -452,6 +466,9 @@ class TTSClient:
                 except Exception:
                     pass
                 self._is_playing = False
+                was_playing = True
+        if was_playing:
+            publish(Events.TTS_STOPPED)
 
     def wait(self, timeout=300):
         """Block until TTS playback finishes or timeout (seconds)."""
@@ -477,7 +494,9 @@ class TTSClient:
 
             # Apply pitch shift if needed (requires decode → re-encode)
             if use_pitch != 1.0:
-                fd, temp_path = tempfile.mkstemp(suffix='.ogg', dir=self.temp_dir)
+                ext_map = {'audio/mp3': '.mp3', 'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/ogg': '.ogg'}
+                ext = ext_map.get(self._provider.audio_content_type, '.ogg')
+                fd, temp_path = tempfile.mkstemp(suffix=ext, dir=self.temp_dir)
                 os.close(fd)
 
                 with open(temp_path, 'wb') as f:
@@ -485,6 +504,7 @@ class TTSClient:
 
                 audio_data, samplerate = sf.read(temp_path)
                 audio_data, samplerate = self._apply_pitch_shift(audio_data, samplerate, pitch=use_pitch)
+                # Re-encode as OGG regardless of input format (consistent output)
                 sf.write(temp_path, audio_data, samplerate, format='OGG', subtype='OPUS')
 
                 with open(temp_path, 'rb') as f:

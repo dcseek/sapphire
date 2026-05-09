@@ -15,15 +15,148 @@ from core.toolsets import toolset_manager
 logger = logging.getLogger(__name__)
 
 
-# Per-context scope isolation — each thread/async-task gets its own values
-scope_memory:   ContextVar[str]  = ContextVar('scope_memory',   default='default')
-scope_goal:     ContextVar[str]  = ContextVar('scope_goal',     default='default')
-scope_knowledge:ContextVar[str]  = ContextVar('scope_knowledge',default='default')
-scope_people:   ContextVar[str]  = ContextVar('scope_people',   default='default')
-scope_email:    ContextVar[str]  = ContextVar('scope_email',    default='default')
-scope_bitcoin:  ContextVar[str]  = ContextVar('scope_bitcoin',  default='default')
-scope_rag:      ContextVar       = ContextVar('scope_rag',      default=None)
-scope_private:  ContextVar[bool] = ContextVar('scope_private',  default=False)
+# Per-context scope isolation — each thread/async-task gets its own values.
+#
+# Only CORE scopes (rag, private) are hardcoded at module load. Everything else —
+# memory, goal, knowledge, people, email, bitcoin, gcal, telegram, discord — is
+# registered dynamically by plugins via register_plugin_scope() at plugin-scan
+# time. Memory/goal/knowledge/people come from the memory plugin's manifest
+# (Phase 4). email/bitcoin/gcal/telegram/discord come from their respective
+# plugin manifests (Phase 3).
+#
+# `rag` is not a user-settable dropdown — it's set programmatically per-chat via
+# `scope_rag.set(f'__rag__:{chat_name}')` in chat.py. `private` is a boolean
+# toggle, also not a plugin scope. Both stay hardcoded forever.
+scope_rag:       ContextVar       = ContextVar('scope_rag',       default=None)
+scope_private:   ContextVar[bool] = ContextVar('scope_private',   default=False)
+
+# Scope registry — single source of truth for all scope operations.
+# Only rag + private at module load; everything else added by plugin_loader.
+# 'setting' is the key in chat_settings dict (None = not user-settable via sidebar).
+SCOPE_REGISTRY = {
+    'rag':       {'var': scope_rag,       'default': None,      'setting': None},
+    'private':   {'var': scope_private,   'default': False,     'setting': 'private_chat'},
+}
+
+
+def __getattr__(name):
+    """Backcompat shim for `from core.chat.function_manager import scope_email`
+    style imports. Resolves `scope_<key>` attribute access against SCOPE_REGISTRY.
+
+    IMPORTANT: This catches module attribute access from OUTSIDE the module. It
+    does NOT catch in-module global name lookups (Python doesn't call module
+    __getattr__ for global name resolution inside a function's own body). All
+    legacy per-scope setter methods that did `scope_email.set(s)` as a global
+    lookup were deleted in Phase 1c. Only `_check_privacy_allowed()` still does
+    a direct global lookup on `scope_private`, which is a core scope that stays
+    hardcoded as a real module-level name below.
+    """
+    if name.startswith('scope_'):
+        key = name[6:]
+        reg = SCOPE_REGISTRY.get(key)
+        if reg:
+            return reg['var']
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def register_plugin_scope(key: str, plugin_name: str = "", default='default'):
+    """Register a scope ContextVar from a plugin manifest. Called by plugin_loader.
+
+    Idempotent: if the key is already registered, logs a warning and returns the existing var.
+    Validates that `key` is a proper identifier to prevent malformed registry entries.
+    """
+    if key in SCOPE_REGISTRY:
+        logger.warning(f"Scope key '{key}' already registered, skipping duplicate from '{plugin_name}'")
+        return SCOPE_REGISTRY[key]['var']
+    if not key or not isinstance(key, str) or not key.isidentifier():
+        logger.error(f"Invalid scope key '{key}' from '{plugin_name}' — must be a valid Python identifier")
+        return None
+    var = ContextVar(f'scope_{key}', default=default)
+    SCOPE_REGISTRY[key] = {'var': var, 'default': default, 'setting': f'{key}_scope', 'plugin': plugin_name}
+    logger.info(f"Registered scope '{key}' from plugin '{plugin_name}'")
+    return var
+
+
+def unregister_plugin_scope(key: str):
+    """Remove a scope from the registry. Called by plugin_loader on unload so
+    the next register_plugin_scope for the same key picks up manifest changes
+    (different default, etc.) instead of hitting the idempotent early-return
+    and silently keeping the stale registration."""
+    if key in SCOPE_REGISTRY:
+        SCOPE_REGISTRY.pop(key, None)
+        logger.info(f"Unregistered scope '{key}'")
+
+
+def apply_scopes_from_settings(fm, settings: dict):
+    """Apply scope values from a chat_settings dict to ContextVars.
+    Converts 'none' string to None (disabled). Used by chat.py, chat_streaming.py, api_fastapi.py.
+
+    Uses list() snapshot over SCOPE_REGISTRY to protect against concurrent modification
+    during plugin hot-reload (would otherwise raise RuntimeError: dict changed size during iteration).
+    """
+    # Build set of known scope setting keys for unknown-key detection (debug log)
+    known_settings = set()
+    for name, reg in list(SCOPE_REGISTRY.items()):
+        key = reg.get('setting')
+        if not key:
+            continue
+        known_settings.add(key)
+        if key in settings:
+            val = settings[key]
+            # Bool settings (private_chat) — coerce to bool
+            if reg['default'] is False or reg['default'] is True:
+                val = val not in (False, 0, '', 'false', '0', 'no', 'off', None)
+            # String 'none' means disabled
+            elif isinstance(val, str) and val == 'none':
+                val = None
+            elif isinstance(val, str) and val == '':
+                val = reg['default']
+            reg['var'].set(val)
+
+    # Debug: log settings keys that look like scopes but have no matching registry entry
+    # (helps diagnose plugin load-order issues)
+    for k in settings:
+        if isinstance(k, str) and k.endswith('_scope') and k not in known_settings:
+            logger.debug(f"apply_scopes_from_settings: key '{k}' has no matching scope in SCOPE_REGISTRY (plugin not loaded?)")
+
+
+def reset_scopes():
+    """Reset all scopes to defaults. Uses list() snapshot for hot-reload safety."""
+    for reg in list(SCOPE_REGISTRY.values()):
+        reg['var'].set(reg['default'])
+
+
+def snapshot_all_scopes() -> dict:
+    """Capture all ContextVar scopes as a plain dict. Uses list() snapshot."""
+    return {name: reg['var'].get() for name, reg in list(SCOPE_REGISTRY.items())}
+
+
+def restore_scopes(scopes: dict):
+    """Restore scopes from a snapshot dict. Missing keys reset to default.
+    Uses list() snapshot for hot-reload safety."""
+    for name, reg in list(SCOPE_REGISTRY.items()):
+        if name in scopes:
+            reg['var'].set(scopes[name])
+        else:
+            reg['var'].set(reg['default'])
+
+
+def scope_setting_keys() -> list:
+    """Return all setting keys that map to scopes (for defaults/persona reset).
+    Uses list() snapshot for hot-reload safety. Excludes private_chat (bool, not a dropdown)."""
+    return [reg['setting'] for reg in list(SCOPE_REGISTRY.values())
+            if reg.get('setting') and reg['setting'] != 'private_chat']
+
+
+def scope_defaults_dict() -> dict:
+    """Return a dict mapping scope setting keys to their default values.
+    Used by get_system_defaults() and similar merge sites."""
+    result = {}
+    for name, reg in list(SCOPE_REGISTRY.items()):
+        setting = reg.get('setting')
+        if setting and setting != 'private_chat':
+            result[setting] = reg['default'] if reg['default'] is not None else 'default'
+    return result
 
 
 class FunctionManager:
@@ -44,12 +177,6 @@ class FunctionManager:
         self._network_functions = set()  # Function names that require network access
         self._is_local_map = {}  # function_name -> is_local value (True, False, or "endpoint")
         self._function_module_map = {}  # function_name -> module_name (for endpoint lookups)
-        
-        # Story engine for games/simulations (None = disabled)
-        self._story_engine = None
-        self._story_engine_enabled = False  # Explicit enabled flag
-        self._turn_getter = None  # Callable that returns current turn number
-        
         # Track what was REQUESTED, not reverse-engineered
         self.current_toolset_name = "none"
         
@@ -161,7 +288,22 @@ class FunctionManager:
             plugin_name: Plugin name for tracking
             plugin_dir: Path to plugin root directory
             tool_paths: List of relative paths to tool files (e.g., ["tools/ha.py"])
+
+        Phase 4 sys.modules idempotency: for each plugin tool file, we compute a
+        canonical module name (e.g., ``plugins.memory.tools.memory_tools``). If
+        that name is already in ``sys.modules``, we REUSE the existing module —
+        this happens when something imports the module via normal Python import
+        before plugin_loader runs (e.g., ``from plugins.memory.tools import
+        memory_tools as mem`` in another file). Reusing prevents the "two module
+        instances with split state" hazard that would otherwise split ``_db_lock``,
+        ``_db_initialized``, ``_backfill_done``, and any other module-level state.
+
+        If the module is NOT in sys.modules, we exec the file into a fresh
+        namespace as before AND install it in sys.modules under the canonical
+        name so subsequent regular-Python imports find the SAME module object.
         """
+        import sys
+        import types
         plugin_dir = Path(plugin_dir)
 
         for tool_rel_path in tool_paths:
@@ -177,30 +319,65 @@ class FunctionManager:
 
             module_name = f"plugin_{plugin_name}_{tool_path.stem}"
 
+            # Canonical name matching Python's namespace package import path.
+            # For plugin_dir="plugins/memory" and tool_rel_path="tools/memory_tools.py"
+            # → canonical_name = "plugins.memory.tools.memory_tools"
+            rel_path_obj = Path(tool_rel_path)
+            parts = [plugin_dir.name] + list(rel_path_obj.with_suffix('').parts)
+            canonical_name = "plugins." + ".".join(parts)
+
             try:
-                source = tool_path.read_text(encoding="utf-8")
-                namespace = {"__file__": str(tool_path), "__name__": module_name}
-                exec(compile(source, str(tool_path), "exec"), namespace)
-
-                if not namespace.get('ENABLED', True):
-                    logger.info(f"Plugin tool '{module_name}' is disabled")
-                    continue
-
-                tools = namespace.get('TOOLS', [])
-                executor = namespace.get('execute')
-
-                if not tools or not executor:
-                    logger.warning(f"Plugin tool '{tool_path}' missing TOOLS or execute()")
-                    continue
-
-                available_functions = namespace.get('AVAILABLE_FUNCTIONS')
-                if available_functions:
-                    tools = [t for t in tools if t['function']['name'] in available_functions]
-
-                emoji = namespace.get('EMOJI', '')
-                mode_filter = namespace.get('MODE_FILTER')
-
+                # Phase 4 (v2): the sys.modules idempotency check + install must happen
+                # INSIDE `_tools_lock` to close the race where a concurrent route handler
+                # could do a lazy `from plugins.memory.tools import memory_tools` via
+                # PEP 420 namespace package between our None-check and our install,
+                # creating a shadow module with split `_db_lock` state. Acquiring the
+                # lock before the check ensures exactly one module object wins.
                 with self._tools_lock:
+                    # sys.modules idempotency check — reuse if already imported
+                    existing_mod = sys.modules.get(canonical_name)
+                    if existing_mod is not None and hasattr(existing_mod, '__dict__'):
+                        logger.debug(f"Plugin '{plugin_name}' tool '{canonical_name}' already in sys.modules — reusing")
+                        namespace = existing_mod.__dict__
+                    else:
+                        source = tool_path.read_text(encoding="utf-8")
+                        namespace = {"__file__": str(tool_path), "__name__": canonical_name}
+                        exec(compile(source, str(tool_path), "exec"), namespace)
+                        # Install the exec'd namespace as a real module in sys.modules
+                        # so future `from plugins.memory.tools import memory_tools` calls
+                        # resolve to the SAME module object (no split state).
+                        mod_stub = types.ModuleType(canonical_name)
+                        mod_stub.__dict__.update(namespace)
+                        mod_stub.__file__ = str(tool_path)
+                        sys.modules[canonical_name] = mod_stub
+
+                    if not namespace.get('ENABLED', True):
+                        logger.info(f"Plugin tool '{module_name}' is disabled")
+                        continue
+
+                    tools = namespace.get('TOOLS', [])
+                    executor = namespace.get('execute')
+
+                    if not tools or not executor:
+                        logger.warning(f"Plugin tool '{tool_path}' missing TOOLS or execute()")
+                        continue
+
+                    available_functions = namespace.get('AVAILABLE_FUNCTIONS')
+                    if available_functions:
+                        tools = [t for t in tools if t['function']['name'] in available_functions]
+
+                    emoji = namespace.get('EMOJI', '')
+                    mode_filter = namespace.get('MODE_FILTER')
+
+                    # Check for function name conflicts BEFORE mutating state
+                    existing_names = {t['function']['name'] for t in self.all_possible_tools}
+                    for tool in tools:
+                        fname = tool['function']['name']
+                        if fname in existing_names:
+                            owner = self._function_module_map.get(fname, 'unknown')
+                            logger.error(f"\033[91mPlugin '{plugin_name}' tool '{fname}' conflicts with existing tool from '{owner}' — plugin NOT loaded\033[0m")
+                            raise ValueError(f"Tool name '{fname}' already registered by '{owner}'")
+
                     self.function_modules[module_name] = {
                         'module': None,
                         'tools': tools,
@@ -210,10 +387,7 @@ class FunctionManager:
                         '_plugin': plugin_name,
                     }
 
-                    # Plugin settings live in user/webui/plugins/{name}.json only
-                    # No register_tool_settings — single settings path, no collisions
-
-                    # Track per-tool flags
+                    # Track per-tool flags (safe — conflict check passed)
                     for tool in tools:
                         func_name = tool['function']['name']
                         if tool.get('network', False):
@@ -224,15 +398,6 @@ class FunctionManager:
 
                     if mode_filter:
                         self._mode_filters[module_name] = mode_filter
-
-                    # Check for function name conflicts — hard error, don't silently corrupt
-                    existing_names = {t['function']['name'] for t in self.all_possible_tools}
-                    for tool in tools:
-                        fname = tool['function']['name']
-                        if fname in existing_names:
-                            owner = self._function_module_map.get(fname, 'unknown')
-                            logger.error(f"\033[91mPlugin '{plugin_name}' tool '{fname}' conflicts with existing tool from '{owner}' — plugin NOT loaded\033[0m")
-                            raise ValueError(f"Tool name '{fname}' already registered by '{owner}'")
 
                     for tool in tools:
                         self.all_possible_tools.append(tool)
@@ -247,11 +412,27 @@ class FunctionManager:
 
                 logger.info(f"Plugin '{plugin_name}' tool '{module_name}': {len(tools)} tools registered")
 
+            except ModuleNotFoundError as e:
+                logger.error(f"Missing dependency for plugin tool '{tool_path}': {e}")
+                from core.event_bus import publish, Events
+                publish(Events.PLUGIN_LOAD_ERROR, {
+                    "plugin": plugin_name, "error": f"Missing pip package: {e.name or e}",
+                    "hint": f"pip install {e.name}" if e.name else str(e)
+                })
             except Exception as e:
                 logger.error(f"Failed to load plugin tool '{tool_path}': {e}", exc_info=True)
 
     def unregister_plugin_tools(self, plugin_name: str):
-        """Remove all tools belonging to a plugin."""
+        """Remove all tools belonging to a plugin.
+
+        Phase 4: also purges the canonical module names from sys.modules so a
+        subsequent reload_plugin() can freshly re-exec the source file. Without
+        this purge, the sys.modules idempotency fix in register_plugin_tools
+        would reuse the stale module on reload and the edits would never take
+        effect. Since unregister is always called as part of a reload cycle,
+        it's safe (and necessary) to drop sys.modules entries here.
+        """
+        import sys
         with self._tools_lock:
             to_remove = [name for name, info in self.function_modules.items()
                          if info.get('_plugin') == plugin_name]
@@ -275,8 +456,91 @@ class FunctionManager:
                                        if t['function']['name'] not in func_names]
                 self._mode_filters.pop(module_name, None)
 
+            # Purge sys.modules entries for this plugin's canonical module names
+            # so the next register_plugin_tools() call freshly re-execs the source.
+            # Canonical names are of the form "plugins.<plugin_name>.tools.<stem>"
+            # (or deeper paths depending on tool_rel_path). Match by prefix.
+            prefix = f"plugins.{plugin_name}."
+            stale = [k for k in list(sys.modules.keys()) if k.startswith(prefix)]
+            for k in stale:
+                sys.modules.pop(k, None)
+            if stale:
+                logger.debug(f"Plugin '{plugin_name}' sys.modules purged: {stale}")
+
         if to_remove:
             logger.info(f"Plugin '{plugin_name}' tools unregistered: {to_remove}")
+
+    def register_dynamic_tools(self, module_name: str, tools: list, executor, plugin_name: str = '', emoji: str = ''):
+        """Register tools from a dynamic source (MCP servers, runtime generators, etc.).
+
+        Unlike register_plugin_tools which loads from Python files, this accepts
+        pre-built tool definitions and an executor callable directly.
+
+        Args:
+            module_name: Unique module key (e.g. "mcp:filesystem")
+            tools: List of tool dicts in OpenAI format [{type: "function", function: {name, description, parameters}}]
+            executor: Callable(function_name, arguments, config) -> (result, success)
+            plugin_name: Owner plugin for cleanup tracking (used by unregister_plugin_tools)
+            emoji: Display emoji for toolset UI
+        """
+        available = [t['function']['name'] for t in tools]
+
+        with self._tools_lock:
+            # Check for conflicts
+            existing_names = {t['function']['name'] for t in self.all_possible_tools}
+            for tool in tools:
+                fname = tool['function']['name']
+                if fname in existing_names:
+                    owner = self._function_module_map.get(fname, 'unknown')
+                    logger.warning(f"Dynamic tool '{fname}' conflicts with '{owner}' — skipping")
+                    tools = [t for t in tools if t['function']['name'] != fname]
+                    available = [a for a in available if a != fname]
+
+            if not tools:
+                return
+
+            self.function_modules[module_name] = {
+                'module': None,
+                'tools': tools,
+                'executor': executor,
+                'available_functions': available,
+                'emoji': emoji,
+                '_plugin': plugin_name,
+            }
+
+            for tool in tools:
+                fname = tool['function']['name']
+                self.execution_map[fname] = executor
+                self._function_module_map[fname] = module_name
+                self.all_possible_tools.append(tool)
+
+            # If "all" toolset is active, add to enabled too
+            if self.current_toolset_name == "all":
+                enabled_names = {t['function']['name'] for t in self._enabled_tools}
+                for tool in tools:
+                    if tool['function']['name'] not in enabled_names:
+                        self._enabled_tools.append(tool)
+
+        logger.info(f"Dynamic tools registered: {module_name} ({len(tools)} tools)")
+
+    def unregister_dynamic_tools(self, module_name: str):
+        """Remove a dynamically registered tool module by name."""
+        with self._tools_lock:
+            info = self.function_modules.pop(module_name, None)
+            if not info:
+                return
+
+            func_names = set(info['available_functions'])
+            for fname in func_names:
+                self.execution_map.pop(fname, None)
+                self._function_module_map.pop(fname, None)
+
+            self.all_possible_tools = [t for t in self.all_possible_tools
+                                       if t['function']['name'] not in func_names]
+            self._enabled_tools = [t for t in self._enabled_tools
+                                   if t['function']['name'] not in func_names]
+
+        logger.info(f"Dynamic tools unregistered: {module_name}")
 
     def _get_current_prompt_mode(self) -> str:
         """Get current prompt mode for filtering. Returns 'monolith' or 'assembled'."""
@@ -331,25 +595,8 @@ class FunctionManager:
 
     @property
     def enabled_tools(self) -> list:
-        """Get enabled tools filtered by current prompt mode, plus story tools if active."""
+        """Get enabled tools filtered by current prompt mode."""
         tools = self._apply_mode_filter(self._enabled_tools)
-
-        # Add story tools if story engine is active (both engine AND flag must be set)
-        if self._story_engine and self._story_engine_enabled:
-            from core.story_engine import TOOLS as STORY_TOOLS
-            # Only include move tool if navigation is configured
-            has_navigation = (self._story_engine.navigation is not None and
-                              self._story_engine.navigation.is_enabled)
-            if has_navigation:
-                tools = tools + STORY_TOOLS
-            else:
-                # Exclude move tool for non-navigation presets
-                tools = tools + [t for t in STORY_TOOLS if t['function']['name'] != 'move']
-
-            # Add custom story tools from story folder
-            custom = self._story_engine.get_story_tools()
-            if custom:
-                tools = tools + custom
 
         # Final dedup — Claude API requires unique tool names
         seen = set()
@@ -362,6 +609,11 @@ class FunctionManager:
             else:
                 logger.warning(f"Duplicate tool '{name}' removed from enabled_tools")
         return deduped
+
+    def snapshot_executors(self) -> dict:
+        """Snapshot current execution_map — use to protect against reload during tool execution."""
+        with self._tools_lock:
+            return dict(self.execution_map)
 
     def update_enabled_functions(self, enabled_names: list):
         """Update enabled tools based on function names from config or ability name."""
@@ -467,15 +719,6 @@ class FunctionManager:
         
         mode = self._get_current_prompt_mode()
 
-        # Include story tool info
-        story_tool_count = 0
-        story_custom_names = []
-        if self._story_engine and self._story_engine_enabled:
-            from core.story_engine import STORY_TOOL_NAMES
-            story_tool_count = len(STORY_TOOL_NAMES)
-            story_custom_names = [t['function']['name'] for t in self._story_engine.get_story_tools()]
-            story_tool_count += len(story_custom_names)
-
         return {
             "name": self.current_toolset_name,
             "function_count": actual_count,
@@ -484,103 +727,32 @@ class FunctionManager:
             "enabled_functions": self.get_enabled_function_names(),
             "prompt_mode": mode,
             "status": "ok" if base_count == expected_count else "partial",
-            "story_tools": story_tool_count,
-            "story_custom_tools": story_custom_names,
         }
 
-    def set_memory_scope(self, s: str):
-        """Set memory scope for current execution context. None = disabled."""
-        scope_memory.set(s)
-        logger.debug(f"Memory scope set to: {s}")
+    # --- Scope methods (thin wrappers around registry functions) ---
 
-    def get_memory_scope(self) -> str:
-        return scope_memory.get()
+    def set_scope(self, name: str, value):
+        """Generic scope setter. Use for any registered scope."""
+        SCOPE_REGISTRY[name]['var'].set(value)
 
-    def set_goal_scope(self, s: str):
-        """Set goal scope for current execution context. None = disabled."""
-        scope_goal.set(s)
-        logger.debug(f"Goal scope set to: {s}")
+    def get_scope(self, name: str):
+        """Generic scope getter."""
+        return SCOPE_REGISTRY[name]['var'].get()
 
-    def get_goal_scope(self) -> str:
-        return scope_goal.get()
-
-    def set_knowledge_scope(self, s: str):
-        """Set knowledge scope for current execution context. None = disabled."""
-        scope_knowledge.set(s)
-        logger.debug(f"Knowledge scope set to: {s}")
-
-    def get_knowledge_scope(self) -> str:
-        return scope_knowledge.get()
-
-    def set_rag_scope(self, s: str):
-        """Set RAG scope for current chat. None = no RAG docs."""
-        scope_rag.set(s)
-
-    def set_people_scope(self, s: str):
-        """Set people scope for current execution context. None = disabled."""
-        scope_people.set(s)
-        logger.debug(f"People scope set to: {s}")
-
-    def get_people_scope(self) -> str:
-        return scope_people.get()
-
-    def set_email_scope(self, s: str):
-        """Set email scope for current execution context. None = disabled."""
-        scope_email.set(s)
-        logger.debug(f"Email scope set to: {s}")
-
-    def get_email_scope(self) -> str:
-        return scope_email.get()
-
-    def set_bitcoin_scope(self, s: str):
-        """Set bitcoin scope for current execution context. None = disabled."""
-        scope_bitcoin.set(s)
-        logger.debug(f"Bitcoin scope set to: {s}")
-
-    def get_bitcoin_scope(self) -> str:
-        return scope_bitcoin.get()
-
-    def set_private_chat(self, enabled: bool):
-        """Set per-chat privacy enforcement."""
-        scope_private.set(bool(enabled))
+    # rag and private are core scopes (not plugin-registered, not deleted in any phase)
+    # Their wrappers stay as thin convenience methods. Per-scope setters for the 7 plugin-style
+    # scopes (memory/goal/knowledge/people/email/bitcoin/gcal) were deleted in v7 — use the
+    # generic set_scope('memory', val) / get_scope('memory') at lines 632-638 instead.
+    def set_rag_scope(self, s): scope_rag.set(s)
+    def set_private_chat(self, enabled): scope_private.set(bool(enabled))
 
     def snapshot_scopes(self) -> dict:
-        """Capture current ContextVar scopes as a plain dict.
+        """Capture current ContextVar scopes as a plain dict."""
+        return snapshot_all_scopes()
 
-        The returned dict can be passed to execute_function(scopes=...)
-        to re-apply scopes after Starlette context resets between yields.
-        """
-        return {
-            'memory': scope_memory.get(),
-            'goal': scope_goal.get(),
-            'knowledge': scope_knowledge.get(),
-            'people': scope_people.get(),
-            'email': scope_email.get(),
-            'bitcoin': scope_bitcoin.get(),
-            'rag': scope_rag.get(),
-            'private': scope_private.get(),
-        }
-
-    def set_story_engine(self, engine, turn_getter=None):
-        """
-        Set story engine for current chat context.
-
-        Args:
-            engine: StoryEngine instance, or None to disable
-            turn_getter: Callable that returns current turn number
-        """
-        self._story_engine = engine
-        self._story_engine_enabled = engine is not None  # Track enabled state
-        self._turn_getter = turn_getter
-        if engine:
-            logger.info(f"Story engine enabled for chat '{engine.chat_name}'")
-        else:
-            logger.debug("Story engine disabled")
-
-    def get_story_engine(self):
-        """Get current story engine. Returns None if disabled."""
-        return self._story_engine
-
+    def apply_scopes(self, settings: dict):
+        """Apply scopes from chat_settings dict."""
+        apply_scopes_from_settings(self, settings)
 
     def _check_privacy_allowed(self, function_name: str) -> tuple:
         """
@@ -643,29 +815,28 @@ class FunctionManager:
         except Exception:
             return None
 
-    def execute_function(self, function_name, arguments, scopes=None):
+    def execute_function(self, function_name, arguments, scopes=None, allowed_tools=None, executor_snapshot=None):
         """Execute a function using the mapped executor.
 
         scopes: optional dict to re-apply ContextVars before execution.
                  Needed because Starlette's iterate_in_threadpool creates
                  fresh context copies per generator yield.
+        allowed_tools: optional set/list of function names that were sent to the LLM.
+                       When provided, validates against this snapshot instead of
+                       current enabled_tools (prevents race conditions on plugin reload).
+        executor_snapshot: optional dict of {name: executor} captured at stream start.
+                           Prevents reload from yanking executor mid-chat.
         """
         if scopes:
-            scope_memory.set(scopes.get('memory', 'default'))
-            scope_goal.set(scopes.get('goal', 'default'))
-            scope_knowledge.set(scopes.get('knowledge', 'default'))
-            scope_people.set(scopes.get('people', 'default'))
-            scope_email.set(scopes.get('email', 'default'))
-            scope_bitcoin.set(scopes.get('bitcoin', 'default'))
-            scope_rag.set(scopes.get('rag'))
-            scope_private.set(scopes.get('private', False))
+            restore_scopes(scopes)
 
         start_time = time.time()
 
-        # Validate function is currently enabled
-        enabled_names = self.get_enabled_function_names()
-        if function_name not in enabled_names:
-            logger.warning(f"Function '{function_name}' called but not enabled. Enabled: {enabled_names}")
+        # Validate function was available when sent to LLM (snapshot)
+        # or is currently enabled (fallback)
+        check_names = set(allowed_tools) if allowed_tools else self.get_enabled_function_names()
+        if function_name not in check_names:
+            logger.warning(f"Function '{function_name}' called but not enabled. Enabled: {check_names}")
             result = f"Error: The tool '{function_name}' is not currently available."
             self._log_tool_call(function_name, arguments, result, time.time() - start_time, False)
             return result
@@ -694,58 +865,45 @@ class FunctionManager:
                 self._log_tool_call(function_name, arguments, result, time.time() - start_time, True)
                 return result
 
-        # Execute — 3 paths: story tools, custom story tools, standard
+        # Execute tool
         result = None
-        from core.story_engine import STORY_TOOL_NAMES, execute as story_execute
+        success = False
+        emap = executor_snapshot if executor_snapshot else self.execution_map
+        executor = emap.get(function_name)
+        if not executor:
+            logger.error(f"No executor found for function '{function_name}'")
+            result = f"The tool {function_name} is recognized but has no execution logic."
+            self._log_tool_call(function_name, arguments, result, time.time() - start_time, False)
+            return result
 
-        if function_name in STORY_TOOL_NAMES:
-            if not self._story_engine or not self._story_engine_enabled:
-                result = f"Error: Story engine not active for tool '{function_name}'"
-                self._log_tool_call(function_name, arguments, result, time.time() - start_time, False)
-                return result
-
-            turn = self._turn_getter() if self._turn_getter else 0
-            try:
-                result, success = story_execute(function_name, arguments, self._story_engine, turn)
-            except Exception as e:
-                logger.error(f"Error executing story tool {function_name}: {e}")
-                result = f"Error executing {function_name}: {str(e)}"
-                success = False
-
-        elif (self._story_engine and self._story_engine_enabled and
-                function_name in self._story_engine.story_tool_names):
-            try:
-                result, success = self._story_engine.execute_story_tool(function_name, arguments)
-            except Exception as e:
-                logger.error(f"Error executing custom story tool {function_name}: {e}")
-                result = f"Error executing {function_name}: {str(e)}"
-                success = False
-
-        else:
-            executor = self.execution_map.get(function_name)
-            if not executor:
-                logger.error(f"No executor found for function '{function_name}'")
-                result = f"The tool {function_name} is recognized but has no execution logic."
-                self._log_tool_call(function_name, arguments, result, time.time() - start_time, False)
-                return result
-
-            try:
-                # For plugin tools, inject plugin settings as 4th arg
-                plugin_settings = self._get_plugin_settings_for(function_name)
-                if plugin_settings is not None:
-                    try:
-                        result, success = executor(function_name, arguments, config, plugin_settings)
-                    except TypeError:
-                        # Backward compat: tool doesn't accept 4th arg
-                        result, success = executor(function_name, arguments, config)
+        try:
+            # For plugin tools, inject plugin settings (4th arg) + credentials (5th arg)
+            plugin_settings = self._get_plugin_settings_for(function_name)
+            if plugin_settings is not None:
+                from core.credentials_manager import credentials
+                import inspect
+                try:
+                    sig = inspect.signature(executor)
+                    nparams = len(sig.parameters)
+                except (ValueError, TypeError):
+                    nparams = 5  # assume full signature
+                if nparams >= 5:
+                    result, success = executor(function_name, arguments, config, plugin_settings, credentials)
+                elif nparams >= 4:
+                    result, success = executor(function_name, arguments, config, plugin_settings)
                 else:
                     result, success = executor(function_name, arguments, config)
-            except Exception as e:
-                logger.error(f"Error executing function {function_name}: {e}")
-                result = f"Error executing {function_name}: {str(e)}"
-                success = False
+            else:
+                result, success = executor(function_name, arguments, config)
+        except Exception as e:
+            logger.error(f"Error executing function {function_name}: {e}")
+            result = f"Error executing {function_name}: {str(e)}"
+            success = False
 
         execution_time = time.time() - start_time
+        if result is None:
+            result = "(no output)"
+
         self._log_tool_call(function_name, arguments, result, execution_time, success)
 
         # post_execute hook — plugins can observe results

@@ -6,6 +6,7 @@
 
 import re
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -19,16 +20,17 @@ class HookEvent:
     Handlers can mutate any field. Changes are visible to subsequent handlers.
 
     Hook points (in pipeline order):
-        post_stt:      After voice transcription — mutate `input` to correct STT
-        on_wake:       Wakeword detected — notification only (must return fast)
-        pre_chat:      Before LLM — mutate `input`, set `skip_llm`/`response` to bypass
-        prompt_inject: During prompt build — append to `context_parts`
-        post_llm:      After LLM response, before save — mutate `response` to filter/translate
-        post_chat:     After response saved — observational (`input`, `response`)
-        pre_execute:   Before tool call — mutate `arguments`, block with `skip_llm`
-        post_execute:  After tool call — observational (`function_name`, `result`)
-        pre_tts:       Before speech — mutate `tts_text`, cancel with `skip_tts`
-        post_tts:      After playback — observational (`tts_text`, metadata has `duration`)
+        post_stt:          After voice transcription — mutate `input` to correct STT
+        on_wake:           Wakeword detected — notification only (must return fast)
+        pre_chat:          Before LLM — mutate `input`, set `skip_llm`/`response` to bypass
+        prompt_inject:     During prompt build — append to `context_parts`
+        post_llm:          After LLM response, before save — mutate `response` to filter/translate
+        post_chat:         After response saved — observational (`input`, `response`)
+        pre_execute:       Before tool call — mutate `arguments`, block with `skip_llm`
+        post_execute:      After tool call — observational (`function_name`, `result`)
+        pre_tts:           Before speech — mutate `tts_text`, cancel with `skip_tts`. metadata['tts_client'] = calling TTSClient
+        post_tts:          After playback — observational (`tts_text`, metadata has `duration`)
+        provider_switched: After TTS/STT/embed provider hot-swap. metadata: `kind` (tts|stt|embed), `provider` (new key). Observational — plugins warm caches / reset state.
 
     Fields:
         input: User's message / STT transcription (mutable in post_stt, pre_chat)
@@ -79,6 +81,7 @@ class HookRunner:
         # {hook_name: [(priority, handler, plugin_name, voice_match)]}
         self._hooks: Dict[str, List[tuple]] = {}
         self._sorted: Dict[str, bool] = {}
+        self._lock = threading.Lock()
 
     def register(self, hook_name: str, handler: Callable, priority: int = 50,
                  plugin_name: str = "", voice_match: dict = None):
@@ -92,23 +95,25 @@ class HookRunner:
             voice_match: Optional dict with 'triggers' list and 'match' type
                          for voice command pre-filtering (exact/starts_with/contains/regex)
         """
-        if hook_name not in self._hooks:
-            self._hooks[hook_name] = []
-        self._hooks[hook_name].append((priority, handler, plugin_name, voice_match))
-        self._sorted[hook_name] = False
+        with self._lock:
+            if hook_name not in self._hooks:
+                self._hooks[hook_name] = []
+            self._hooks[hook_name].append((priority, handler, plugin_name, voice_match))
+            self._sorted[hook_name] = False
         logger.info(f"[HOOKS] Registered {plugin_name}:{handler.__name__} on '{hook_name}' (priority {priority})")
 
     def unregister(self, hook_name: str, plugin_name: str):
         """Remove all handlers for a plugin from a specific hook."""
-        if hook_name in self._hooks:
-            before = len(self._hooks[hook_name])
-            self._hooks[hook_name] = [
-                h for h in self._hooks[hook_name] if h[2] != plugin_name
-            ]
-            removed = before - len(self._hooks[hook_name])
-            if removed:
-                self._sorted[hook_name] = False
-                logger.info(f"[HOOKS] Unregistered {removed} handler(s) for '{plugin_name}' from '{hook_name}'")
+        with self._lock:
+            if hook_name in self._hooks:
+                before = len(self._hooks[hook_name])
+                self._hooks[hook_name] = [
+                    h for h in self._hooks[hook_name] if h[2] != plugin_name
+                ]
+                removed = before - len(self._hooks[hook_name])
+                if removed:
+                    self._sorted[hook_name] = False
+                    logger.info(f"[HOOKS] Unregistered {removed} handler(s) for '{plugin_name}' from '{hook_name}'")
 
     def unregister_plugin(self, plugin_name: str):
         """Remove all handlers for a plugin from all hooks."""
@@ -157,13 +162,14 @@ class HookRunner:
         Returns:
             The (possibly mutated) event object
         """
-        handlers = self._hooks.get(hook_name)
-        if not handlers:
-            return event
+        with self._lock:
+            handlers = self._hooks.get(hook_name)
+            if not handlers:
+                return event
+            self._ensure_sorted(hook_name)
+            snapshot = list(handlers)
 
-        self._ensure_sorted(hook_name)
-
-        for priority, handler, plugin_name, voice_match in handlers:
+        for priority, handler, plugin_name, voice_match in snapshot:
             if not self._check_voice_match(voice_match, event.input):
                 continue
 
@@ -184,8 +190,9 @@ class HookRunner:
 
     def get_handlers(self, hook_name: str) -> list:
         """Get registered handlers for a hook (for debugging/introspection)."""
-        self._ensure_sorted(hook_name)
-        return list(self._hooks.get(hook_name, []))
+        with self._lock:
+            self._ensure_sorted(hook_name)
+            return list(self._hooks.get(hook_name, []))
 
     def has_handlers(self, hook_name: str) -> bool:
         """Check if any handlers are registered for a hook."""
@@ -193,8 +200,9 @@ class HookRunner:
 
     def clear(self):
         """Remove all handlers. Used for testing."""
-        self._hooks.clear()
-        self._sorted.clear()
+        with self._lock:
+            self._hooks.clear()
+            self._sorted.clear()
 
 
 # Singleton

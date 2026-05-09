@@ -40,12 +40,23 @@ async def create_backup(request: Request, _=Depends(require_login)):
     if backup_type not in ('daily', 'weekly', 'monthly', 'manual'):
         raise HTTPException(status_code=400, detail="Invalid backup type")
 
-    filename = backup_manager.create_backup(backup_type)
-    if filename:
-        backup_manager.rotate_backups()
-        return {"status": "success", "filename": filename}
-    else:
-        raise HTTPException(status_code=500, detail="Backup creation failed")
+    # Hold the backup lock across create + rotate so this manual trigger
+    # can't interleave with the 3am scheduled cycle. Witch-hunt 2026-04-21
+    # finding R5 — without this, overlapping runs could delete an in-flight
+    # partial via rotation mtime sort.
+    # Health gate: don't create new backups while corruption sentinels are
+    # active — the whole point is to preserve last-known-good. R1.
+    if backup_manager._active_corruption_sentinels():
+        raise HTTPException(status_code=409, detail=(
+            "Corruption sentinel active — backup creation halted to preserve "
+            "last-known-good tarballs. See user/health/CORRUPT_*.flag."
+        ))
+    with backup_manager._backup_op_lock:
+        filename = backup_manager.create_backup(backup_type)
+        if filename:
+            backup_manager.rotate_backups()
+            return {"status": "success", "filename": filename}
+    raise HTTPException(status_code=500, detail="Backup creation failed")
 
 
 @router.delete("/api/backup/delete/{filename}")
@@ -225,14 +236,22 @@ async def test_audio_output(request: Request, _=Depends(require_login), system=D
 
 @router.get("/api/continuity/tasks")
 async def list_continuity_tasks(request: Request, _=Depends(require_login), system=Depends(get_system)):
-    """List continuity tasks. Optional ?heartbeat=true/false filter."""
+    """List continuity tasks. Optional ?heartbeat=true/false or ?type=daemon/webhook filter."""
     if not hasattr(system, 'continuity_scheduler') or not system.continuity_scheduler:
         return {"tasks": []}
     tasks = system.continuity_scheduler.list_tasks()
+
+    # Type filter (new)
+    type_filter = request.query_params.get("type")
+    if type_filter:
+        tasks = [t for t in tasks if t.get("type", "task") == type_filter]
+
+    # Legacy heartbeat filter (backward compat) — excludes daemon/webhook types
     hb_filter = request.query_params.get("heartbeat")
     if hb_filter is not None:
         want_hb = hb_filter.lower() in ("true", "1", "yes")
-        tasks = [t for t in tasks if t.get("heartbeat", False) == want_hb]
+        tasks = [t for t in tasks if t.get("heartbeat", False) == want_hb
+                 and t.get("type", "task") in ("task", "heartbeat")]
     return {"tasks": tasks}
 
 
@@ -364,9 +383,9 @@ async def provider_status(request: Request, _=Depends(require_login)):
 async def check_packages(request: Request, _=Depends(require_login)):
     """Check optional packages. Returns format expected by setup wizard UI."""
     checks = {
-        "tts": {"package": "Kokoro TTS", "requirements": "requirements-tts.txt", "mod": "kokoro"},
-        "stt": {"package": "Faster Whisper", "requirements": "requirements-stt.txt", "mod": "faster_whisper"},
-        "wakeword": {"package": "OpenWakeWord", "requirements": "requirements-wakeword.txt", "mod": "openwakeword"},
+        "tts": {"package": "Kokoro TTS", "requirements": "install/requirements-tts.txt", "mod": "kokoro"},
+        "stt": {"package": "Faster Whisper", "requirements": "install/requirements-stt.txt", "mod": "faster_whisper"},
+        "wakeword": {"package": "OpenWakeWord", "requirements": "install/requirements-wakeword.txt", "mod": "openwakeword"},
     }
     packages = {}
     for key, info in checks.items():
@@ -384,7 +403,8 @@ async def get_wizard_step(request: Request, _=Depends(require_login)):
     """Get wizard step."""
     from core.settings_manager import settings as sm
     managed = sm.is_managed()
-    return {"step": getattr(config, 'SETUP_WIZARD_STEP', 'complete'), "managed": managed}
+    docker = sm.is_docker()
+    return {"step": getattr(config, 'SETUP_WIZARD_STEP', 'complete'), "managed": managed, "docker": docker}
 
 
 @router.put("/api/setup/wizard-step")
@@ -495,3 +515,203 @@ async def request_system_shutdown(request: Request, _=Depends(require_login)):
         raise HTTPException(status_code=503, detail="Shutdown not available")
     callback()
     return {"status": "shutting_down", "message": "Shutdown initiated"}
+
+
+# =============================================================================
+# UPDATE ROUTES
+# =============================================================================
+
+@router.get("/api/system/update-check")
+async def check_for_update(request: Request, _=Depends(require_login)):
+    """Return cached update status. Fires a background GitHub check if cache is stale.
+    Non-blocking: the dashboard shouldn't wait 4s on a network round-trip.
+    Users who want a fresh check can call ?force=1 (or POST /api/system/update-check-now)."""
+    from core.updater import updater
+    from core.settings_manager import settings
+    force = request.query_params.get('force') in ('1', 'true', 'yes')
+    if force:
+        status = updater.check_for_update(force=True)
+    else:
+        updater.check_for_update_async()
+        status = updater.status()
+    status['docker'] = settings.is_docker()
+    status['managed'] = settings.is_managed()
+    return status
+
+
+@router.post("/api/system/update")
+async def do_update(request: Request, _=Depends(require_login)):
+    """Schedule a deferred update. Pre-flights everything; refuses with a
+    specific reason if anything's weird. On success, writes a pending-update
+    marker and requests restart — main.py runs the pull + pip install before
+    re-spawning sapphire.py. Result is readable via /api/system/last-update-result.
+    """
+    from core.updater import updater
+    from core.settings_manager import settings
+    import asyncio
+
+    if settings.is_docker() or settings.is_managed():
+        raise HTTPException(status_code=403, detail="Use docker compose pull to update Docker installations")
+
+    success, message = updater.do_update()
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
+    # Return the HTTP response BEFORE triggering the restart — otherwise the
+    # socket can be torn down mid-response and the client sees "update failed"
+    # when it actually scheduled fine. Schedule restart on a short delay so
+    # the response has time to flush.
+    from core.api_fastapi import get_restart_callback
+    callback = get_restart_callback()
+    if callback:
+        async def _delayed_restart():
+            await asyncio.sleep(0.5)
+            try:
+                callback()
+            except Exception:
+                pass
+        asyncio.create_task(_delayed_restart())
+
+    return {"status": "scheduled", "message": message}
+
+
+@router.get("/api/system/last-update-result")
+async def last_update_result(request: Request, _=Depends(require_login)):
+    """Return the result of the most recent deferred update attempt, then
+    clear it so the UI only shows the toast once per update cycle."""
+    from core.updater import read_last_update_result
+    clear = request.query_params.get('clear', '1') in ('1', 'true', 'yes')
+    result = read_last_update_result(clear=clear)
+    return {"result": result}
+
+
+# =============================================================================
+# METRICS ROUTES
+# =============================================================================
+
+@router.get("/api/metrics/enabled")
+async def metrics_enabled(request: Request, _=Depends(require_login)):
+    """Check if metrics tracking is enabled."""
+    return {"enabled": getattr(config, 'METRICS_ENABLED', True)}
+
+
+@router.put("/api/metrics/enabled")
+async def set_metrics_enabled(request: Request, _=Depends(require_login)):
+    """Toggle metrics tracking."""
+    from core.settings_manager import settings
+    data = await request.json()
+    enabled = bool(data.get("enabled", True))
+    settings.set("METRICS_ENABLED", enabled)
+    return {"enabled": enabled}
+
+
+@router.get("/api/metrics/summary")
+async def metrics_summary(request: Request, _=Depends(require_login)):
+    """Aggregate token usage summary."""
+    from core.metrics import metrics
+    days = int(request.query_params.get("days", 30))
+    return metrics.summary(days=days)
+
+
+@router.get("/api/metrics/breakdown")
+async def metrics_breakdown(request: Request, _=Depends(require_login)):
+    """Token usage broken down by model."""
+    from core.metrics import metrics
+    days = int(request.query_params.get("days", 30))
+    return {"models": metrics.breakdown_by_model(days=days)}
+
+
+@router.get("/api/metrics/daily")
+async def metrics_daily(request: Request, _=Depends(require_login)):
+    """Daily token usage for charting."""
+    from core.metrics import metrics
+    days = int(request.query_params.get("days", 30))
+    return {"daily": metrics.daily_usage(days=days)}
+
+
+# =============================================================================
+# EVENT ROUTES (Daemons + Webhooks)
+# =============================================================================
+
+@router.get("/api/events/sources")
+async def get_event_sources(request: Request, _=Depends(require_login)):
+    """Get available daemon event sources from loaded plugins."""
+    from core.plugin_loader import plugin_loader
+    return {"sources": plugin_loader.get_event_sources()}
+
+
+@router.post("/api/events/emit/{source_name}")
+async def emit_event(source_name: str, request: Request, _=Depends(require_login), system=Depends(get_system)):
+    """Emit a daemon event to trigger matching tasks. Used by daemon plugins."""
+    if not hasattr(system, 'continuity_scheduler') or not system.continuity_scheduler:
+        raise HTTPException(status_code=503, detail="Scheduler not available")
+    data = await request.json()
+    event_data = json.dumps(data) if isinstance(data, dict) else str(data)
+
+    from core.plugin_loader import plugin_loader
+    plugin_loader.emit_daemon_event(source_name, event_data)
+    return {"status": "emitted", "source": source_name}
+
+
+@router.api_route("/api/events/webhook/{path:path}", methods=["GET", "POST", "PUT"])
+async def webhook_endpoint(path: str, request: Request, system=Depends(get_system)):
+    """Webhook endpoint — no auth required. Matches path to webhook tasks."""
+    if not hasattr(system, 'continuity_scheduler') or not system.continuity_scheduler:
+        raise HTTPException(status_code=503, detail="Scheduler not available")
+
+    method = request.method
+    task = system.continuity_scheduler.find_webhook_task(path, method)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"No webhook configured for {method} /{path}")
+
+    # Verify secret if task has one configured
+    trigger_config = task.get("trigger_config", {})
+    webhook_secret = trigger_config.get("secret")
+    if webhook_secret:
+        import hashlib, hmac
+        auth_header = request.headers.get("x-webhook-secret", "")
+        sig_header = request.headers.get("x-hub-signature-256", "")
+        if sig_header:
+            # GitHub-style HMAC: x-hub-signature-256: sha256=<hex>
+            raw_body = await request.body()
+            expected = "sha256=" + hmac.new(webhook_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(sig_header, expected):
+                raise HTTPException(status_code=403, detail="Invalid webhook signature")
+        elif auth_header:
+            # Simple secret comparison
+            if not hmac.compare_digest(auth_header, webhook_secret):
+                raise HTTPException(status_code=403, detail="Invalid webhook secret")
+        else:
+            raise HTTPException(status_code=403, detail="Webhook secret required but not provided")
+
+    # Payload size limit (1MB)
+    content_length = int(request.headers.get("content-length", 0))
+    if content_length > 1_048_576:
+        raise HTTPException(status_code=413, detail="Payload too large (max 1MB)")
+
+    # Build event data from request
+    content_type = request.headers.get("content-type", "")
+    if "json" in content_type:
+        try:
+            body = await request.json()
+            event_data = json.dumps(body, indent=2)
+        except Exception:
+            event_data = (await request.body()).decode("utf-8", errors="replace")
+    elif method in ("POST", "PUT"):
+        raw = await request.body()
+        if len(raw) > 1_048_576:
+            raise HTTPException(status_code=413, detail="Payload too large (max 1MB)")
+        event_data = raw.decode("utf-8", errors="replace")
+    else:
+        # GET — use query params
+        event_data = json.dumps(dict(request.query_params))
+
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"[Webhook] {method} /{path} from {client_ip} (task: {task.get('name')})")
+
+    result = system.continuity_scheduler.fire_event_task(task["id"], event_data)
+
+    from core.event_bus import publish, Events
+    publish(Events.WEBHOOK_FIRED, {"path": path, "method": method, "task_id": task["id"]})
+
+    return {"status": "triggered", "task": task["name"], "queued": result.get("queued", False)}

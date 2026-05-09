@@ -9,6 +9,13 @@
 
 ---
 
+## Untested One-line installers (please report bugs if you try)
+### Linux
+  curl -sL https://raw.githubusercontent.com/ddxfish/sapphire/main/install/install.sh | bash
+### Windows (PowerShell)                
+  irm https://raw.githubusercontent.com/ddxfish/sapphire/main/install/install.ps1 | iex 
+
+
 ## Prerequisites
 
 ### Linux
@@ -73,20 +80,20 @@ For a lighter footprint without voice features:
 ```bash
 git clone https://github.com/ddxfish/sapphire.git
 cd sapphire
-pip install -r requirements-minimal.txt
+pip install -r install/requirements-minimal.txt
 ```
 
 Then add features as needed:
 
 ```bash
 # TTS (Kokoro voice synthesis)
-pip install -r requirements-tts.txt
+pip install -r install/requirements-tts.txt
 
-# STT (Faster Whisper transcription)  
-pip install -r requirements-stt.txt
+# STT (Faster Whisper transcription)
+pip install -r install/requirements-stt.txt
 
 # Wakeword (OpenWakeWord detection)
-pip install -r requirements-wakeword.txt
+pip install -r install/requirements-wakeword.txt
 ```
 
 Enable each in Settings after installing, then restart.
@@ -123,12 +130,12 @@ Use cloud APIs for stronger models. Your conversations go to external servers.
 |----------|-----------|-------------|
 | Claude (Anthropic) | Complex tasks, conversation | [console.anthropic.com](https://console.anthropic.com/) |
 | OpenAI | GPT models, well-supported | [platform.openai.com](https://platform.openai.com/) |
-| Fireworks | Fast, many open models | [fireworks.ai](https://fireworks.ai/) |
+| Gemini (Google) | Fast, multimodal | [aistudio.google.com](https://aistudio.google.com/) |
 
 Set your API key via environment variable or in the setup wizard:
 - `ANTHROPIC_API_KEY` for Claude
 - `OPENAI_API_KEY` for OpenAI
-- `FIREWORKS_API_KEY` for Fireworks
+- `GOOGLE_API_KEY` for Gemini
 
 Sapphire automatically falls back between enabled providers if one fails.
 
@@ -236,7 +243,7 @@ journalctl --user -u sapphire -f
 
 ## Making It Yours
 
-At this point, try Sapphire. If you want to make it yours, continue with [CONFIGURATION.md](CONFIGURATION.md)
+At this point, try Sapphire. If you want to make it yours, continue with [QUICK-START.md](QUICK-START.md)
 
 ---
 
@@ -275,19 +282,19 @@ python main.py
 
 MINIMAL INSTALL (no voice features):
 ```
-pip install -r requirements-minimal.txt
-# Then add: requirements-tts.txt, requirements-stt.txt, requirements-wakeword.txt as needed
+pip install -r install/requirements-minimal.txt
+# Then add: install/requirements-tts.txt, install/requirements-stt.txt, install/requirements-wakeword.txt as needed
 ```
 
 OPTIONAL FEATURES (only for minimal install):
-- TTS: pip install -r requirements-tts.txt
-- STT: pip install -r requirements-stt.txt  
-- Wakeword: pip install -r requirements-wakeword.txt
+- TTS: pip install -r install/requirements-tts.txt
+- STT: pip install -r install/requirements-stt.txt
+- Wakeword: pip install -r install/requirements-wakeword.txt
 (Enable in Settings after install, then restart)
 
 LLM OPTIONS:
 - Local: LM Studio on port 1234 (private, free)
-- Cloud: Claude/OpenAI/Fireworks (set API key via env var or Settings)
+- Cloud: Claude/OpenAI/Gemini (set API key via env var or Settings)
 - Setup wizard configures on first run
 - Auto-fallback between enabled providers
 

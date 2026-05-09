@@ -3,9 +3,22 @@
   "version": "1.0.0",
   "description": "Bitcoin — check balance, send BTC, view transactions",
   "author": "sapphire",
+  "icon": "₿",
   "url": "https://sapphireblue.dev",
   "priority": 50,
+  "pip_dependencies": ["bit"],
   "capabilities": {
-    "tools": ["tools/bitcoin_tool.py"]
+    "tools": ["tools/bitcoin_tool.py"],
+    "scopes": [
+      {
+        "key": "bitcoin",
+        "label": "bitcoin",
+        "endpoint": "/api/bitcoin/wallets",
+        "data_key": "wallets",
+        "value_field": "scope",
+        "name_field": "scope",
+        "label_template": "{scope}"
+      }
+    ]
   }
 }

@@ -14,7 +14,9 @@ A plugin is a package that can contain tools, yes, but also hooks into parts of 
 - **Block or modify tool arguments** before execution (`pre_execute`)
 - **Control TTS** — change the voice, rewrite text, or cancel speech entirely (`pre_tts`)
 - **React to wakeword detection** before recording starts (`on_wake`)
+- **Provide custom inference providers** — TTS, STT, Embedding, or LLM backends that appear in settings dropdowns ([guide](providers.md))
 - **Run scheduled tasks** on cron timers, independent of any conversation
+- **Run background daemons** — listen for external events (messages, emails) and trigger AI responses ([guide](daemons.md))
 - **Register voice commands** — keyword triggers that bypass the LLM entirely
 - **Ship a settings UI** that renders in the browser with zero JavaScript (or full custom JS)
 
@@ -35,10 +37,12 @@ A tool is a single function the AI can call. A plugin is an autonomous package t
 | [Tools](tools.md) | Tool file format, schema flags, scopes, reading settings, privacy patterns |
 | [Routes](routes.md) | Custom HTTP endpoints — path params, auth enforcement, handler signature |
 | [Schedule](schedule.md) | Cron tasks — manifest fields, handler contract, examples |
+| [Daemons](daemons.md) | Background event listeners — Telegram, Discord, Email, custom sources |
 | [Settings](settings.md) | Manifest-declared settings, custom web UI, settings API, danger confirms |
 | [Web UI](web-ui.md) | Shared JS modules, CSS variables, modals, CSRF, style injection |
 | [Signing](signing.md) | Verification states, sideloading, signing your own plugins |
 | [Lifecycle](lifecycle.md) | Startup, live toggle, hot reload, rescan, error isolation |
+| [Publishing](publishing.md) | How to structure your repo and submit to the Sapphire Store |
 | [AI Reference](ai-reference.md) | Compact reference for Sapphire's own use when building plugins |
 
 ---
@@ -90,6 +94,24 @@ Enable in Settings > Plugins. It loads immediately — no restart.
 | `user/plugins/` | User | 100-199 | No (gitignored) |
 
 User plugin priorities are automatically offset into the 100-199 range.
+
+---
+
+## Plugin Tests
+
+Tests for a plugin live alongside it, at `plugins/<name>/tests/test_*.py`. They travel with the plugin on install/uninstall so authors can maintain them next to the code they cover.
+
+```
+plugins/my-plugin/
+  plugin.json
+  tools/my_tool.py
+  tests/
+    test_my_tool.py        # no __init__.py
+```
+
+Run from the repo root with `pytest` — the root `pytest.ini` sets `testpaths = tests plugins` and skips `user/`, `infra/`, and `tmp/`.
+
+**Do not add an `__init__.py` to `tests/`.** pytest collects tests across every plugin's `tests/` dir simultaneously; an `__init__.py` turns each one into the same import name (`tests`) and triggers import-name collisions. Leave the directory as plain, non-package — pytest's rootdir-relative collection handles it fine.
 
 ---
 

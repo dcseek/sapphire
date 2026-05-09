@@ -1,6 +1,6 @@
 # Plugin Tools
 
-Plugin tools use the same format as `functions/*.py` — they're registered with the function manager and the AI calls them like any built-in tool.
+Plugin tools are registered with the function manager and the AI calls them like any built-in tool. The format is the same across all plugins (see `plugins/memory/tools/` for examples of core tools, or `plugins/email/tools/` for a plugin tool).
 
 For simple tool creation without a full plugin, see [TOOLMAKER.md](../TOOLMAKER.md).
 
@@ -159,6 +159,8 @@ state.delete("counter")        # remove key
 state.all()                    # entire dict
 state.clear()                  # wipe everything
 ```
+
+PluginState is thread-safe — daemon threads, continuity tasks, and API handlers can all read/write the same plugin's state concurrently without data loss.
 
 For heavier storage, plugins can create their own SQLite database.
 

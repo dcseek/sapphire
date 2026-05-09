@@ -1,9 +1,17 @@
 // views/personas.js - Persona manager view
 import { listPersonas, getPersona, createPersona, updatePersona, deletePersona,
          duplicatePersona, loadPersona, createFromChat, uploadAvatar, deleteAvatar,
+         exportPersona, importPersona,
          avatarUrl, avatarImg, avatarFallback } from '../shared/persona-api.js';
 import { renderPersonaTabs, bindPersonaTabs } from '../shared/persona-tabs.js';
 import { getInitData } from '../shared/init-data.js';
+import {
+    renderScopeDropdowns,
+    fetchScopeData,
+    populateScopeOptions,
+    readScopeSettingsFromDom
+} from '../shared/scope-dropdowns.js';
+import { showExportDialog, showImportDialog } from '../shared/import-export.js';
 import * as ui from '../ui.js';
 import { updateScene } from '../features/scene.js';
 import { applyTrimColor } from '../features/chat-settings.js';
@@ -28,7 +36,10 @@ function updateSliderFill(slider) {
 let initData = null;
 let llmProviders = [];
 let llmMetadata = {};
-let scopeData = { memory: [], goals: [], knowledge: [], people: [] };
+// Phase 2e: scope dropdowns are now driven by /api/init scope_declarations
+// via the shared scope-dropdowns renderer. Was hardcoded {memory, goals, knowledge, people}.
+let scopeDeclarations = [];
+let scopeFetchedData = {};
 let voicesData = null;
 
 export default {
@@ -75,14 +86,15 @@ export default {
 
 async function loadData() {
     try {
-        const [pRes, init, llmResp, memS, goalS, knowS, pplS, ttsResp] = await Promise.allSettled([
+        // Fetch init data first so we know which scope_declarations to drive from
+        const initEarly = await getInitData();
+        scopeDeclarations = initEarly?.scope_declarations || [];
+
+        const [pRes, init, llmResp, scopeResp, ttsResp] = await Promise.allSettled([
             listPersonas(),
-            getInitData(),
+            Promise.resolve(initEarly),  // already awaited above
             fetch('/api/llm/providers').then(r => r.ok ? r.json() : null),
-            fetch('/api/memory/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/goals/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/knowledge/scopes').then(r => r.ok ? r.json() : null),
-            fetch('/api/knowledge/people/scopes').then(r => r.ok ? r.json() : null),
+            fetchScopeData(scopeDeclarations),
             fetch('/api/tts/voices').then(r => r.ok ? r.json() : null)
         ]);
 
@@ -95,12 +107,7 @@ async function loadData() {
             llmProviders = llmData.providers || [];
             llmMetadata = llmData.metadata || {};
         }
-        scopeData = {
-            memory: memS.status === 'fulfilled' ? (memS.value?.scopes || []) : [],
-            goals: goalS.status === 'fulfilled' ? (goalS.value?.scopes || []) : [],
-            knowledge: knowS.status === 'fulfilled' ? (knowS.value?.scopes || []) : [],
-            people: pplS.status === 'fulfilled' ? (pplS.value?.scopes || []) : []
-        };
+        scopeFetchedData = scopeResp.status === 'fulfilled' ? scopeResp.value : {};
         voicesData = ttsResp.status === 'fulfilled' ? ttsResp.value : null;
 
         if (!selectedName && personas.length) selectedName = personas[0].name;
@@ -126,6 +133,7 @@ function render() {
             <div class="panel-left panel-list">
                 <div class="panel-list-header">
                     <span class="panel-list-title">Personas</span>
+                    <button class="btn-sm" id="pa-import" title="Import persona">\u2B07</button>
                     <button class="btn-sm" id="pa-new" title="New from current chat">+</button>
                 </div>
                 <div class="panel-list-items" id="pa-list">
@@ -148,6 +156,27 @@ function render() {
     `;
 
     bindPersonaTabs(container);
+
+    // Mount shared scope dropdowns (Phase 2e) — must run BEFORE bindEvents so the
+    // fresh <select> elements get auto-save change listeners. renderScopeDropdowns
+    // is synchronous; populateScopeOptions is async but the seed values in the
+    // initial render already reflect the persona's current scope settings, so the
+    // UI is correct immediately — populate just fills in the full option lists.
+    const scopeContainer = container.querySelector('#pa-scope-dropdowns');
+    if (scopeContainer && scopeDeclarations.length) {
+        const enabledPlugins = new Set(initData?.plugins_config?.enabled || []);
+        const rendererOptions = {
+            idPrefix: 'pa-s-',
+            enabledPlugins,
+            cssClasses: { field: 'pa-field', fieldRow: 'pa-field-row' },
+        };
+        const settings = selectedData?.settings || {};
+        renderScopeDropdowns(scopeContainer, scopeDeclarations, settings, rendererOptions);
+        // Fire-and-forget populate; listeners are on the <select> elements which
+        // survive innerHTML replacement of their children.
+        populateScopeOptions(scopeContainer, scopeDeclarations, scopeFetchedData, settings, rendererOptions);
+    }
+
     bindEvents();
 }
 
@@ -186,6 +215,7 @@ function renderDetail(p, isActive) {
                             ? '<button class="btn-sm" id="pa-clear-default" title="Remove as default">&#x2B50; Default</button>'
                             : '<button class="btn-sm" id="pa-set-default" title="Set as default for new chats">Set Default</button>'}
                         <button class="btn-sm" id="pa-duplicate">Duplicate</button>
+                        <button class="btn-sm" id="pa-export">Export</button>
                         <button class="btn-sm danger" id="pa-delete">Delete</button>
                     </div>
                 </div>
@@ -273,10 +303,10 @@ function renderDetail(p, isActive) {
                     <div class="pa-fence-heading"><span>Mind Scopes</span></div>
                     <div class="pa-fence">
                         <div class="pa-fence-body pa-fence-body-grid">
-                            ${renderScopeField('memory_scope', 'Memory', s, scopeData.memory)}
-                            ${renderScopeField('goal_scope', 'Goals', s, scopeData.goals)}
-                            ${renderScopeField('knowledge_scope', 'Knowledge', s, scopeData.knowledge)}
-                            ${renderScopeField('people_scope', 'People', s, scopeData.people)}
+                            <!-- display:contents makes this placeholder transparent to the
+                                 grid layout — the pa-field children injected by the shared
+                                 renderer become direct children of pa-fence-body-grid. -->
+                            <div id="pa-scope-dropdowns" style="display:contents"></div>
                         </div>
                     </div>
                 </div>
@@ -357,18 +387,8 @@ function renderProviderOptions(current) {
     return html;
 }
 
-function renderScopeField(key, label, settings, scopes) {
-    const current = settings[key] || 'default';
-    const opts = scopes.map(s =>
-        `<option value="${s.name}"${s.name === current ? ' selected' : ''}>${s.name} (${s.count})</option>`
-    ).join('') || `<option value="${current}">${current}</option>`;
-    return `
-        <div class="pa-field">
-            <label>${label}</label>
-            <select id="pa-s-${key}" data-key="${key}">${opts}</select>
-        </div>
-    `;
-}
+// renderScopeField deleted in Phase 2e — persona Mind Scopes are now rendered by
+// the shared scope-dropdowns.js module driven by /api/init scope_declarations.
 
 function updateModelSelector(providerKey, currentModel) {
     const group = container.querySelector('#pa-model-group');
@@ -398,7 +418,7 @@ function updateModelSelector(providerKey, currentModel) {
             select.innerHTML += `<option value="${currentModel}" selected>${currentModel}</option>`;
         }
         if (group) group.style.display = '';
-    } else if (providerKey === 'other') {
+    } else {
         if (custom) custom.value = currentModel || '';
         if (customGroup) customGroup.style.display = '';
     }
@@ -518,7 +538,8 @@ function bindEvents() {
     // Clear default
     container.querySelector('#pa-clear-default')?.addEventListener('click', async () => {
         try {
-            await fetch('/api/personas/default', { method: 'DELETE' });
+            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            await fetch('/api/personas/default', { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
             defaultPersona = '';
             render();
             ui.showToast('Default cleared', 'success');
@@ -536,6 +557,74 @@ function bindEvents() {
             render();
             ui.showToast(`Duplicated`, 'success');
         } catch (e) { ui.showToast(e.message || 'Failed', 'error'); }
+    });
+
+    // Export
+    container.querySelector('#pa-export')?.addEventListener('click', async () => {
+        if (!selectedName) return;
+        try {
+            const bundle = await exportPersona(selectedName);
+            showExportDialog({
+                type: 'Persona',
+                name: selectedName,
+                data: bundle,
+                filename: `${selectedName}.persona.json`,
+            });
+        } catch (e) { ui.showToast(e.message || 'Export failed', 'error'); }
+    });
+
+    // Import (accepts both persona bundles and plain prompt exports)
+    container.querySelector('#pa-import')?.addEventListener('click', () => {
+        showImportDialog({
+            type: 'Persona or Prompt',
+            overwrites: [
+                { key: 'prompt', label: 'Overwrite prompt if it already exists' },
+                { key: 'avatar', label: 'Overwrite avatar if it already exists' },
+            ],
+            existingNames: personas.map(p => p.name),
+            validate: (d) => {
+                // Full persona bundle
+                if (d.sapphire_export && d.type === 'persona') return null;
+                // Prompt export (sapphire_export format)
+                if (d.sapphire_export && d.type === 'prompt' && d.prompt) return null;
+                // Legacy prompt export (just {name, prompt, components})
+                if (d.prompt && (d.prompt.type || d.prompt.content)) return null;
+                return 'Not a valid Sapphire persona or prompt export';
+            },
+            getName: (d) => d.name || 'imported',
+            onImport: async (parsed, { name, overwrites }) => {
+                let bundle;
+                if (parsed.sapphire_export && parsed.type === 'persona') {
+                    // Full persona — pass through
+                    bundle = parsed;
+                } else {
+                    // Prompt-only — wrap into a persona bundle with defaults
+                    const promptData = parsed.prompt || {};
+                    const promptName = parsed.name || name;
+                    bundle = {
+                        sapphire_export: true,
+                        type: 'persona',
+                        version: 1,
+                        name,
+                        tagline: '',
+                        trim_color: '',
+                        voice: {},
+                        avatar: null,
+                        prompt: { name: promptName, data: promptData },
+                    };
+                    if (parsed.components) bundle.components = parsed.components;
+                }
+                bundle.name = name;
+                bundle.overwrite_prompt = overwrites.prompt || false;
+                bundle.overwrite_avatar = overwrites.avatar || false;
+                await importPersona(bundle);
+                selectedName = name.replace(/\s+/g, '_').toLowerCase();
+            },
+            onDone: async () => {
+                await loadData();
+                render();
+            },
+        });
     });
 
     // Delete
@@ -614,8 +703,12 @@ function bindEvents() {
         }
     });
 
-    // Name/tagline changes (debounced save)
-    container.querySelector('#pa-name')?.addEventListener('input', () => debouncedSave());
+    // Name changes only on blur (rename triggers re-render which yanks focus)
+    container.querySelector('#pa-name')?.addEventListener('blur', () => debouncedSave());
+    container.querySelector('#pa-name')?.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+    });
+    // Tagline changes (debounced save on input is fine)
     container.querySelector('#pa-tagline')?.addEventListener('input', () => debouncedSave());
 
     // Provider change → update model dropdown
@@ -657,6 +750,12 @@ function collectSettings() {
     const get = (id) => container.querySelector(`#pa-s-${id}`)?.value || '';
     const getChecked = (id) => container.querySelector(`#pa-s-${id}`)?.checked || false;
 
+    // Phase 2e: scope values come from the shared renderer's DOM via data-scope-key
+    // attribute discovery. Supports all 9 scopes dynamically — pre-existing silent
+    // bug fixed for free (telegram_scope and discord_scope can now be saved on personas).
+    const scopeContainer = container.querySelector('#pa-scope-dropdowns');
+    const scopeFields = readScopeSettingsFromDom(scopeContainer, { missingValue: 'default' });
+
     return {
         prompt: get('prompt'),
         toolset: get('toolset'),
@@ -671,14 +770,7 @@ function collectSettings() {
         llm_primary: get('llm_primary') || 'auto',
         llm_model: getSelectedModel(),
         trim_color: get('trim_color') || '#4a9eff',
-        memory_scope: get('memory_scope') || 'default',
-        goal_scope: get('goal_scope') || 'default',
-        knowledge_scope: get('knowledge_scope') || 'default',
-        people_scope: get('people_scope') || 'default',
-        story_engine_enabled: selectedData?.settings?.story_engine_enabled ?? false,
-        story_preset: selectedData?.settings?.story_preset ?? null,
-        story_vars_in_prompt: selectedData?.settings?.story_vars_in_prompt ?? false,
-        story_in_prompt: selectedData?.settings?.story_in_prompt !== false,
+        ...scopeFields,
     };
 }
 

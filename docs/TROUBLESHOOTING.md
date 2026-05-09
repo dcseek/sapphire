@@ -18,13 +18,13 @@
 - Try http:// and https://
 - Delete cookies for this site
 - Test in private browsing window
-- Delete secret key `~/.config/sapphire/secret_key`
+- Reset password (see [Reset Password](#reset-password) below)
 - Restart Sapphire app
 
 **Blank page or "Unauthorized"**
 - Clear browser cookies for localhost:8073
 - Try incognito window
-- Delete `~/.config/sapphire/secret_key` and restart the app
+- Reset password (see [Reset Password](#reset-password) below) and restart
 
 **Certificate warning on first visit**
 - Expected with self-signed certs. Accept once (Advanced → Proceed) and the browser remembers it.
@@ -66,7 +66,7 @@
 
 **Wake word not triggering**
 - Check which wakeword you are using in settings
-- Make sure you pip installed requirements-wakeword.txt
+- Make sure you pip installed install/requirements-wakeword.txt
 - Check wakeword is enabled in settings, reboot app after
 - Turn your mic volume up to 70-100%
 - Set system mic to the mic you want wakeword on
@@ -93,7 +93,7 @@
 - Not all models support thinking. Check provider supports it.
 - Claude: Enable "Extended Thinking" in LLM settings
 - GPT-5.x: Uses Responses API, set reasoning_summary to "detailed"
-- Fireworks: Only works with thinking-enabled models (Qwen3-Thinking, Kimi-K2-Thinking)
+- Gemini: Set reasoning_effort (low/medium/high) on thinking-enabled models (Gemini 2.5 Flash/Pro)
 - Local models via LM Studio: May need specific model that outputs `<think>` tags
 
 **Thinking breaks when switching providers**
@@ -208,20 +208,67 @@ Nuke the conda environment and reinstall from scratch. Your `user/` data is pres
 conda deactivate && conda remove -n sapphire --all -y && conda create -n sapphire python=3.11 -y && conda activate sapphire && pip install -r requirements.txt && python main.py
 ```
 
+## Reset Password
+
+Delete the password hash file and restart Sapphire. This resets your login — you'll set a new password on next visit. Your chats, settings, and user data are untouched.
+
+**Linux:**
+```bash
+rm ~/.config/sapphire/secret_key
+```
+
+**macOS:**
+```bash
+rm ~/Library/Application\ Support/Sapphire/secret_key
+```
+
+**Windows (PowerShell):**
+```powershell
+Remove-Item "$env:APPDATA\Sapphire\secret_key"
+```
+
+**Docker:**
+```bash
+docker exec sapphire rm /root/.config/sapphire/secret_key
+docker restart sapphire
+```
+
+Then restart Sapphire (or just the container for Docker).
+
 ## Reset Everything (Delete data)
 
-Nuclear option - fresh start:
+Nuclear option - fresh start. Deletes all user data including chats, settings, and password.
 
+**Linux:**
 ```bash
-# Stop Sapphire
 pkill -f "python main.py"
-
-# Remove user data (keeps code)
 rm -rf user/
 rm ~/.config/sapphire/secret_key
-
-# Restart
 python main.py
 ```
+
+**macOS:**
+```bash
+pkill -f "python main.py"
+rm -rf user/
+rm ~/Library/Application\ Support/Sapphire/secret_key
+python main.py
+```
+
+**Windows (PowerShell):**
+```powershell
+# Stop Sapphire first (close the terminal or Ctrl+C)
+Remove-Item -Recurse -Force user\
+Remove-Item "$env:APPDATA\Sapphire\secret_key"
+python main.py
+```
+
+**Docker:**
+```bash
+docker compose down
+rm -rf ~/sapphire/user/
+docker compose up -d
+```
+The Docker container's config dir is ephemeral — password resets automatically when the container is recreated.
 
 You'll need to re-run setup and reconfigure settings.

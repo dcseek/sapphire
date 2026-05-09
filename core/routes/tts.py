@@ -119,12 +119,16 @@ async def test_tts(request: Request, _=Depends(require_login), system=Depends(ge
         return {"success": False, "provider": prov_name, "error": "No TTS provider loaded"}
     t0 = time.time()
     try:
+        # Force fresh validation for explicit test (bypass cache)
+        if hasattr(provider, '_validated'):
+            provider._validated = None
         available = await asyncio.to_thread(provider.is_available)
     except Exception as e:
         return {"success": False, "provider": prov_name, "error": str(e)}
     elapsed = round((time.time() - t0) * 1000)
     if not available:
-        return {"success": False, "provider": prov_name, "error": "Provider not available", "ms": elapsed}
+        error = getattr(provider, '_last_error', None) or "Provider not available"
+        return {"success": False, "provider": prov_name, "error": error, "ms": elapsed}
     return {"success": True, "provider": prov_name, "ms": elapsed}
 
 
@@ -150,9 +154,12 @@ async def tts_voices_post(request: Request, _=Depends(require_login), system=Dep
 
     # If an API key is provided, fetch voices directly (pre-save browsing)
     if api_key:
-        from core.tts.providers.elevenlabs import ElevenLabsTTSProvider
-        voices = await asyncio.to_thread(ElevenLabsTTSProvider.list_voices_with_key, api_key)
-        return {"voices": voices}
+        try:
+            from plugins.elevenlabs.provider import ElevenLabsTTSProvider
+            voices = await asyncio.to_thread(ElevenLabsTTSProvider.list_voices_with_key, api_key)
+            return {"voices": voices}
+        except ImportError:
+            return {"voices": [], "error": "ElevenLabs plugin not available"}
 
     # Otherwise use the active provider
     provider = getattr(system.tts, '_provider', None)
@@ -206,7 +213,23 @@ async def handle_transcribe(request: Request, audio: UploadFile = File(...), _=D
             pass
     if transcribed_text is None:
         raise HTTPException(status_code=500, detail="Transcription failed — check STT provider logs")
-    return {"text": transcribed_text}
+
+    # post_stt hook — mirror wakeword pipeline. Plugins that correct /
+    # translate / normalize transcription need to see ALL STT input, not
+    # just the wake path. Before this the browser-mic route silently
+    # bypassed post_stt. H8 fix 2026-04-22.
+    try:
+        from core.hooks import hook_runner, HookEvent
+        if hook_runner.has_handlers("post_stt"):
+            import config as _cfg
+            stt_event = HookEvent(input=transcribed_text, config=_cfg,
+                                  metadata={"system": system})
+            hook_runner.fire("post_stt", stt_event)
+            transcribed_text = stt_event.input
+    except Exception as e:
+        logger.debug(f"post_stt hook fire failed: {e}")
+
+    return {"text": transcribed_text, "quiet": transcribed_text == ""}
 
 
 @router.post("/api/mic/active")

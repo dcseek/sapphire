@@ -8,6 +8,7 @@ from .chat_tool_calling import strip_ui_markers, wrap_tool_result, _extract_tool
 from .llm_providers import LLMResponse, get_generation_params
 from core.event_bus import publish, Events
 from core.hooks import hook_runner, HookEvent
+from core.metrics import metrics as token_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,11 @@ class StreamingChat:
         self.current_stream = None
         self.ephemeral = False
         self.is_streaming = False
+        # Name of the chat currently streaming — lets /api/cancel refuse to
+        # cancel a DIFFERENT chat's stream (was global, cross-chat tabs
+        # interfered). Full per-request streaming state is H4 architecture
+        # work; this is the narrow scoping fix. H5 2026-04-22.
+        self.active_chat_name = None
 
     def _cleanup_stream(self):
         """Safely close current stream if it exists."""
@@ -77,9 +83,15 @@ class StreamingChat:
             self.cancel_flag = False
             self.current_stream = None
             self.ephemeral = False
-
-            # Update story engine FIRST (before building messages) based on current settings
-            self.main_chat._update_story_engine()
+            try:
+                self.active_chat_name = self.main_chat.session_manager.get_active_chat_name()
+            except Exception:
+                self.active_chat_name = None
+            # H4 follow-up 2026-04-22: was `_is_streaming = True` (single bool).
+            # Two concurrent streams on same chat had the first finisher set
+            # False while the second was still running → append_messages_to_chat
+            # guard failed → mid-turn history corruption. Counter fix.
+            self.main_chat.session_manager.begin_streaming()
 
             # Plugin pre_chat hook — can modify input, bypass LLM, or stop propagation
             if hook_runner.has_handlers("pre_chat"):
@@ -105,7 +117,9 @@ class StreamingChat:
             if not skip_user_message:
                 # Build content list if files or images present, otherwise just text
                 if files or images:
-                    user_content = [{"type": "text", "text": user_input}]
+                    user_content = []
+                    if user_input:
+                        user_content.append({"type": "text", "text": user_input})
                     for f in (files or []):
                         user_content.append({
                             "type": "file",
@@ -142,21 +156,14 @@ class StreamingChat:
                 logger.info(f"[THINK] Forced thinking prefill: {force_prefill}")
                 yield {"type": "content", "text": force_prefill}
             
-            # Set memory and goal scopes for this chat context
+            # Set scopes for this chat context
+            # Reset first to prevent bleed across chats when plugin scopes come and go
+            # (a chat saved before a plugin was enabled wouldn't have its scope key in settings,
+            # and apply_scopes only sets keys present in the dict → stale value survives).
+            from core.chat.function_manager import reset_scopes
+            reset_scopes()
             chat_settings = self.main_chat.session_manager.get_chat_settings()
-            memory_scope = chat_settings.get('memory_scope', 'default')
-            self.main_chat.function_manager.set_memory_scope(memory_scope if memory_scope != 'none' else None)
-            goal_scope = chat_settings.get('goal_scope', 'default')
-            self.main_chat.function_manager.set_goal_scope(goal_scope if goal_scope != 'none' else None)
-            knowledge_scope = chat_settings.get('knowledge_scope', 'default')
-            self.main_chat.function_manager.set_knowledge_scope(knowledge_scope if knowledge_scope != 'none' else None)
-            people_scope = chat_settings.get('people_scope', 'default')
-            self.main_chat.function_manager.set_people_scope(people_scope if people_scope != 'none' else None)
-            email_scope = chat_settings.get('email_scope', 'default')
-            self.main_chat.function_manager.set_email_scope(email_scope if email_scope != 'none' else None)
-            bitcoin_scope = chat_settings.get('bitcoin_scope', 'default')
-            self.main_chat.function_manager.set_bitcoin_scope(bitcoin_scope if bitcoin_scope != 'none' else None)
-            self.main_chat.function_manager.set_private_chat(chat_settings.get('private_chat', False))
+            self.main_chat.function_manager.apply_scopes(chat_settings)
             chat_name = self.main_chat.session_manager.get_active_chat_name()
             self.main_chat.function_manager.set_rag_scope(f"__rag__:{chat_name}")
 
@@ -165,7 +172,11 @@ class StreamingChat:
             _scopes = self.main_chat.function_manager.snapshot_scopes()
 
             # Send only enabled tools - model should only know about active tools
+            # Snapshot names too — used to validate tool calls against what LLM actually received
+            # Snapshot executors to protect against reload yanking executors mid-chat
             enabled_tools = self.main_chat.function_manager.enabled_tools
+            _allowed_tool_names = {t["function"]["name"] for t in enabled_tools if "function" in t}
+            _executor_snapshot = self.main_chat.function_manager.snapshot_executors()
             provider_key, provider, model_override = self.main_chat._select_provider()
             
             # Determine effective model (per-chat override or provider default)
@@ -174,7 +185,7 @@ class StreamingChat:
             gen_params = get_generation_params(
                 provider_key,
                 effective_model,
-                getattr(config, 'LLM_PROVIDERS', {})
+                {**getattr(config, 'LLM_PROVIDERS', {}), **getattr(config, 'LLM_CUSTOM_PROVIDERS', {})}
             )
             
             # Pass model override to provider if set
@@ -188,6 +199,9 @@ class StreamingChat:
                 logger.info("[CONTINUE] Disabled thinking for continue (can't replay signatures)")
 
             tool_call_count = 0
+            # Accumulate token usage across all iterations for final summary
+            cumulative_tokens = {"prompt": 0, "completion": 0, "thinking": 0, "total": 0,
+                                 "cache_read": 0, "cache_write": 0, "iterations": 0}
 
             for iteration in range(config.MAX_TOOL_ITERATIONS):
                 if self.cancel_flag:
@@ -236,20 +250,24 @@ class StreamingChat:
                         
                         if event_type == "content":
                             text = event.get("text", "")
+                            # Close thinking tag if transitioning from think to prose
+                            if in_thinking:
+                                yield {"type": "content", "text": "</think>\n\n"}
+                                in_thinking = False
                             current_content += text
                             yield {"type": "content", "text": text}
-                        
+
                         elif event_type == "thinking":
                             # Thinking from Claude - emit as content with tags for UI
                             text = event.get("text", "")
                             current_thinking += text
-                            
+
                             # Emit thinking wrapped in tags for UI rendering
                             if not in_thinking:
                                 yield {"type": "content", "text": "<think>"}
                                 in_thinking = True
                             yield {"type": "content", "text": text}
-                        
+
                         elif event_type == "tool_call":
                             # Close thinking tag if open before tool calls
                             if in_thinking:
@@ -307,14 +325,24 @@ class StreamingChat:
                 # Build metadata if not provided by provider
                 if not metadata:
                     iteration_end_time = time.time()
-                    # Use first chunk time if available, else end time (edge case: no chunks)
                     gen_start = first_chunk_time or iteration_end_time
                     duration = round(iteration_end_time - gen_start, 2)
-                    # Rough token estimate: ~4 chars per token
-                    est_content_tokens = len(current_content) // 4 if current_content else 0
-                    est_thinking_tokens = len(current_thinking) // 4 if current_thinking else 0
-                    total_tokens = est_content_tokens + est_thinking_tokens
-                    
+
+                    # Try real usage from provider response first, fall back to estimate
+                    resp_usage = final_response.usage if final_response and hasattr(final_response, 'usage') else None
+                    if resp_usage:
+                        content_tokens = resp_usage.get("completion_tokens", 0)
+                        prompt_tokens = resp_usage.get("prompt_tokens", 0)
+                        total_tokens = resp_usage.get("total_tokens", 0)
+                        estimated = False
+                    else:
+                        content_tokens = len(current_content) // 4 if current_content else 0
+                        prompt_tokens = 0
+                        total_tokens = content_tokens + (len(current_thinking) // 4 if current_thinking else 0)
+                        estimated = True
+
+                    thinking_tokens = len(current_thinking) // 4 if current_thinking else 0
+
                     metadata = {
                         "provider": provider_key,
                         "model": effective_model,
@@ -322,14 +350,41 @@ class StreamingChat:
                         "end_time": time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(iteration_end_time)),
                         "duration_seconds": duration,
                         "tokens": {
-                            "content": est_content_tokens,
-                            "thinking": est_thinking_tokens,
+                            "content": content_tokens,
+                            "thinking": thinking_tokens,
+                            "prompt": prompt_tokens,
                             "total": total_tokens,
-                            "estimated": True  # Flag that these are estimates
+                            "estimated": estimated
                         },
-                        "tokens_per_second": round(total_tokens / duration, 1) if duration > 0 else 0
+                        "tokens_per_second": round(content_tokens / duration, 1) if duration > 0 else 0
                     }
+                    # Forward cache stats from provider
+                    if resp_usage:
+                        for k in ("cache_read_tokens", "cache_write_tokens"):
+                            if resp_usage.get(k):
+                                metadata["tokens"][k] = resp_usage[k]
                 
+                # Accumulate tokens across iterations
+                if metadata and metadata.get("tokens"):
+                    t = metadata["tokens"]
+                    cumulative_tokens["prompt"] += t.get("prompt", 0)
+                    cumulative_tokens["completion"] += t.get("content", 0)
+                    cumulative_tokens["thinking"] += t.get("thinking", 0)
+                    cumulative_tokens["total"] += t.get("total", 0)
+                    cumulative_tokens["cache_read"] += t.get("cache_read_tokens", 0)
+                    cumulative_tokens["cache_write"] += t.get("cache_write_tokens", 0)
+                    cumulative_tokens["iterations"] += 1
+
+                    # Record per-call metrics
+                    call_type = "tool_call" if tool_calls else "conversation"
+                    estimated = metadata["tokens"].get("estimated", False)
+                    try:
+                        chat_name = self.main_chat.session_manager.get_active_chat_name()
+                        token_metrics.record(chat_name, provider_key, effective_model,
+                                             call_type, metadata, estimated=estimated)
+                    except Exception:
+                        pass  # Metrics are best-effort
+
                 # Generate fallback IDs for tool calls missing them (GLM, some OpenAI-compat APIs)
                 for tc in tool_calls:
                     if tc.get("function", {}).get("name") and not tc.get("id"):
@@ -392,7 +447,7 @@ class StreamingChat:
                         publish(Events.TOOL_EXECUTING, {"name": function_name})
 
                         try:
-                            function_result = self.main_chat.function_manager.execute_function(function_name, function_args, scopes=_scopes)
+                            function_result = self.main_chat.function_manager.execute_function(function_name, function_args, scopes=_scopes, allowed_tools=_allowed_tool_names, executor_snapshot=_executor_snapshot)
                             result_str, tool_imgs = _extract_tool_images(function_result, self.main_chat.session_manager)
                             if tool_imgs:
                                 iteration_tool_images.extend(tool_imgs)
@@ -533,6 +588,20 @@ class StreamingChat:
                         ))
                         full_content = llm_event.response or full_content
 
+                    # Attach cumulative token stats from all iterations
+                    if cumulative_tokens["iterations"] > 1 and metadata:
+                        metadata["cumulative_tokens"] = {
+                            "prompt": cumulative_tokens["prompt"],
+                            "completion": cumulative_tokens["completion"],
+                            "thinking": cumulative_tokens["thinking"],
+                            "total": cumulative_tokens["total"],
+                            "iterations": cumulative_tokens["iterations"]
+                        }
+                        if cumulative_tokens["cache_read"]:
+                            metadata["cumulative_tokens"]["cache_read"] = cumulative_tokens["cache_read"]
+                        if cumulative_tokens["cache_write"]:
+                            metadata["cumulative_tokens"]["cache_write"] = cumulative_tokens["cache_write"]
+
                     # Save final response with thinking separated
                     self.main_chat.session_manager.add_assistant_final(
                         content=full_content,
@@ -548,6 +617,10 @@ class StreamingChat:
 
                     return
             
+            # If cancelled, don't make another API call — fall through to finally block
+            if self.cancel_flag:
+                return
+
             # Loop exhausted - force final response
             logger.warning(f"[STREAMING] Exceeded max iterations ({config.MAX_TOOL_ITERATIONS}). Forcing final answer.")
             
@@ -568,6 +641,7 @@ class StreamingChat:
                 final_content = ""
                 final_thinking = ""
                 final_metadata = None
+                forced_final_response = None
                 in_thinking = False
                 final_start_time = time.time()
                 
@@ -579,9 +653,12 @@ class StreamingChat:
                     
                     if event_type == "content":
                         chunk = event.get("text", "")
+                        if in_thinking:
+                            yield {"type": "content", "text": "</think>\n\n"}
+                            in_thinking = False
                         final_content += chunk
                         yield {"type": "content", "text": chunk}
-                    
+
                     elif event_type == "thinking":
                         text = event.get("text", "")
                         final_thinking += text
@@ -597,14 +674,27 @@ class StreamingChat:
                             final_thinking = event["thinking"]
                         if event.get("metadata"):
                             final_metadata = event["metadata"]
+                        forced_final_response = event.get("response")
                         break
-                
+
                 if not final_metadata:
                     final_end_time = time.time()
                     duration = round(final_end_time - final_start_time, 2)
-                    est_content_tokens = len(final_content) // 4 if final_content else 0
-                    est_thinking_tokens = len(final_thinking) // 4 if final_thinking else 0
-                    
+
+                    resp_usage = forced_final_response.usage if forced_final_response and hasattr(forced_final_response, 'usage') else None
+                    if resp_usage:
+                        content_tokens = resp_usage.get("completion_tokens", 0)
+                        prompt_tokens = resp_usage.get("prompt_tokens", 0)
+                        total_tokens = resp_usage.get("total_tokens", 0)
+                        estimated = False
+                    else:
+                        content_tokens = len(final_content) // 4 if final_content else 0
+                        prompt_tokens = 0
+                        total_tokens = content_tokens + (len(final_thinking) // 4 if final_thinking else 0)
+                        estimated = True
+
+                    thinking_tokens = len(final_thinking) // 4 if final_thinking else 0
+
                     final_metadata = {
                         "provider": provider_key,
                         "model": effective_model,
@@ -612,13 +702,18 @@ class StreamingChat:
                         "end_time": time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(final_end_time)),
                         "duration_seconds": duration,
                         "tokens": {
-                            "content": est_content_tokens,
-                            "thinking": est_thinking_tokens,
-                            "total": est_content_tokens + est_thinking_tokens,
-                            "estimated": True
+                            "content": content_tokens,
+                            "thinking": thinking_tokens,
+                            "prompt": prompt_tokens,
+                            "total": total_tokens,
+                            "estimated": estimated
                         },
-                        "tokens_per_second": round(est_content_tokens / duration, 1) if duration > 0 else 0
+                        "tokens_per_second": round(content_tokens / duration, 1) if duration > 0 else 0
                     }
+                    if resp_usage:
+                        for k in ("cache_read_tokens", "cache_write_tokens"):
+                            if resp_usage.get(k):
+                                final_metadata["tokens"][k] = resp_usage[k]
                 
                 if final_content:
                     full_final = (force_prefill or "") + final_content
@@ -655,16 +750,51 @@ class StreamingChat:
 
         except ConnectionError as e:
             logger.warning(f"[STREAMING] {e}")
+            # Save error so history doesn't end with a dangling user message
+            self.main_chat.session_manager.add_assistant_final(
+                f"[Connection error: {e}]"
+            )
             self._cleanup_stream()
             raise
         except Exception as e:
             logger.error(f"[ERR] [STREAMING FATAL] Unhandled error: {e}", exc_info=True)
+            # Save error so history doesn't end with a dangling user message
+            # (consecutive user messages break Claude's alternating requirement)
+            self.main_chat.session_manager.add_assistant_final(
+                f"[Error: {type(e).__name__}: {e}]"
+            )
             self._cleanup_stream()
             raise
         
         finally:
             logger.info(f"[CLEANUP] [STREAMING FINALLY] Cleaning up, cancel_flag={self.cancel_flag}")
+            # Close any open tool cycle so history isn't left in a broken state
+            # (e.g. user hit Stop mid-tool-execution)
+            if self.main_chat.session_manager._in_tool_cycle:
+                logger.info("[CLEANUP] Closing orphaned tool cycle from cancelled stream")
+                # Inject dummy tool_results for any pending tool_calls so LLM history
+                # stays valid (providers require tool_result after tool_calls)
+                try:
+                    msgs = self.main_chat.session_manager.current_chat.messages
+                    for msg in reversed(msgs):
+                        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                            existing_results = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+                            for tc in msg["tool_calls"]:
+                                tc_id = tc.get("id", "")
+                                if tc_id not in existing_results:
+                                    self.main_chat.session_manager.add_tool_result(
+                                        tc_id, tc.get("function", {}).get("name", "unknown"),
+                                        "[Cancelled by user]"
+                                    )
+                            break
+                except Exception as e:
+                    logger.warning(f"[CLEANUP] Failed to inject cancel tool results: {e}")
+                self.main_chat.session_manager.add_assistant_final(
+                    content="[Cancelled during tool execution]"
+                )
             self._cleanup_stream()
             self.cancel_flag = False
             self.is_streaming = False
+            self.active_chat_name = None
+            self.main_chat.session_manager.end_streaming()
             publish(Events.AI_TYPING_END)

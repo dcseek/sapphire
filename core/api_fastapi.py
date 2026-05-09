@@ -94,16 +94,62 @@ USER_PLUGINS_DIR_WEB = PROJECT_ROOT / "user" / "plugins"
 import mimetypes
 @app.get("/plugin-web/{plugin_name}/{path:path}")
 async def serve_plugin_web(plugin_name: str, path: str, _=Depends(require_login)):
-    """Serve web assets from plugin web/ directories."""
+    """Serve web assets from plugin web/ and app/ directories.
+    /plugin-web/{name}/foo.js     → {plugin}/web/foo.js  (existing behavior)
+    /plugin-web/{name}/app/foo.js → {plugin}/app/foo.js  (app pages)
+    """
     for base_dir in [SYSTEM_PLUGINS_DIR, USER_PLUGINS_DIR_WEB]:
-        web_dir = (base_dir / plugin_name / "web").resolve()
+        plugin_dir = (base_dir / plugin_name).resolve()
+
+        # If path starts with app/, serve from app/ directory directly
+        if path.startswith("app/"):
+            file_path = (plugin_dir / path).resolve()
+            if str(file_path).startswith(str(plugin_dir)) and file_path.exists() and file_path.is_file():
+                content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+                return FileResponse(file_path, media_type=content_type)
+            continue
+
+        # Otherwise serve from web/ subdirectory (existing behavior)
+        web_dir = (plugin_dir / "web").resolve()
         file_path = (web_dir / path).resolve()
-        # Security: ensure path doesn't escape web/ dir
         if not str(file_path).startswith(str(web_dir)):
             continue
         if file_path.exists() and file_path.is_file():
             content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
             return FileResponse(file_path, media_type=content_type)
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+# Avatar assets (user/avatar/)
+@app.get("/api/avatar/{filename}")
+async def serve_avatar_asset(filename: str, _=Depends(require_login)):
+    """Serve avatar files from user/avatar/."""
+    avatar_dir = (PROJECT_ROOT / "user" / "avatar").resolve()
+    file_path = (avatar_dir / filename).resolve()
+    if not str(file_path).startswith(str(avatar_dir)) or not file_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    return FileResponse(file_path, media_type=content_type)
+
+# Workspace file serving — Claude Code project outputs
+@app.get("/workspace/{project}/{path:path}")
+async def serve_workspace(project: str, path: str, _=Depends(require_login)):
+    """Serve files from Claude Code workspace directories."""
+    try:
+        from core.plugin_loader import plugin_loader
+        settings = plugin_loader.get_plugin_settings("claude-code") or {}
+        ws_dir = settings.get('workspace_dir', '~/claude-workspaces')
+    except Exception:
+        ws_dir = '~/claude-workspaces'
+    workspace_base = Path(os.path.expanduser(ws_dir)).resolve()
+    project_dir = (workspace_base / project).resolve()
+    if not str(project_dir).startswith(str(workspace_base)):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    file_path = (project_dir / path).resolve()
+    if not str(file_path).startswith(str(project_dir)):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if file_path.exists() and file_path.is_file():
+        content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        return FileResponse(file_path, media_type=content_type)
     return JSONResponse({"error": "Not found"}, status_code=404)
 
 # Templates
@@ -204,10 +250,36 @@ async def security_headers(request: Request, call_next):
 
 
 # Session middleware - added AFTER HTTP middleware so it's outermost (Starlette LIFO)
-_password_hash = get_password_hash()
+# Use a dedicated session secret file (not the password hash) so sessions survive
+# password changes and are stable from first boot through setup completion.
+def _get_session_secret():
+    from core.setup import CONFIG_DIR
+    secret_file = CONFIG_DIR / 'session_secret'
+    if secret_file.exists():
+        try:
+            val = secret_file.read_text().strip()
+            if val:  # Guard against empty/truncated file from crash
+                return val
+        except Exception:
+            pass
+    # Generate and persist a new secret (atomic write)
+    secret = secrets.token_hex(32)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = secret_file.with_suffix('.tmp')
+        tmp_path.write_text(secret)
+        import sys
+        if sys.platform != 'win32':
+            import os as _os
+            _os.chmod(tmp_path, 0o600)
+        tmp_path.replace(secret_file)
+    except Exception:
+        pass  # Falls back to ephemeral secret (session won't survive restart)
+    return secret
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=_password_hash if _password_hash else secrets.token_hex(32),
+    secret_key=_get_session_secret(),
     session_cookie="sapphire_session",
     max_age=30 * 24 * 60 * 60,  # 30 days
     same_site="lax",
@@ -226,7 +298,12 @@ async def favicon():
 
 def _no_cache_html(template: str, context: dict):
     """TemplateResponse with aggressive no-cache headers (bypass middleware issues)."""
-    resp = templates.TemplateResponse(template, context)
+    # Starlette 0.30+ requires request as first positional arg
+    request = context.get("request")
+    try:
+        resp = templates.TemplateResponse(request, template, context=context)
+    except TypeError:
+        resp = templates.TemplateResponse(name=template, context=context)
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
@@ -271,12 +348,19 @@ async def setup_submit(request: Request):
         return RedirectResponse(url="/setup?error=rate", status_code=302)
 
     form = await request.form()
+
+    # CSRF check
+    csrf_token = form.get('csrf_token')
+    if not validate_csrf(request, csrf_token):
+        logger.warning(f"CSRF validation failed on setup from {client_ip}")
+        return RedirectResponse(url="/setup?error=csrf", status_code=302)
+
     password = form.get('password', '')
     confirm = form.get('confirm', '')
 
     if not password:
         return RedirectResponse(url="/setup?error=empty", status_code=302)
-    if len(password) < 6:
+    if len(password) < 10:
         return RedirectResponse(url="/setup?error=short", status_code=302)
     if password != confirm:
         return RedirectResponse(url="/setup?error=mismatch", status_code=302)
@@ -328,6 +412,11 @@ async def login_submit(request: Request):
         return RedirectResponse(url="/login?error=config", status_code=302)
 
     if verify_password(password, password_hash):
+        # Rotate session state before promoting to authenticated. Prevents
+        # session-fixation — a pre-login cookie an attacker could have planted
+        # (LAN XSS on another localhost app, stale iframe, etc) gets cleared
+        # before we stamp logged_in. 2026-04-22 M5 fix.
+        request.session.clear()
         request.session['logged_in'] = True
         request.session['username'] = getattr(config, 'AUTH_USERNAME', 'user')
         logger.info(f"Successful login from {client_ip}")
@@ -350,7 +439,8 @@ from core.tts.utils import validate_voice as _validate_tts_voice, default_voice 
 
 
 def _apply_chat_settings(system, settings: dict):
-    """Apply chat settings to the system (TTS, prompt, ability, state engine)."""
+    """Apply chat settings to the system (TTS, prompt, ability, state engine).
+    Each section is isolated so one failure doesn't skip the rest."""
     try:
         if "voice" in settings:
             voice = _validate_tts_voice(settings["voice"])
@@ -359,7 +449,10 @@ def _apply_chat_settings(system, settings: dict):
             system.tts.set_pitch(settings["pitch"])
         if "speed" in settings:
             system.tts.set_speed(settings["speed"])
+    except Exception as e:
+        logger.error(f"Error applying TTS settings: {e}")
 
+    try:
         if "prompt" in settings:
             prompt_name = settings["prompt"]
             prompt_data = prompts.get_prompt(prompt_name)
@@ -372,28 +465,63 @@ def _apply_chat_settings(system, settings: dict):
                     prompts.apply_scenario(prompt_name)
 
                 logger.info(f"Applied prompt: {prompt_name}")
+            else:
+                # Chat settings named a prompt that no longer exists (likely
+                # deleted after the chat was configured with it). Fall back to
+                # 'default' loudly AND rewrite the chat's settings so the
+                # next activation doesn't take the same wrong turn. Silent
+                # no-op here = chat sticks with whatever prompt the previous
+                # chat left loaded. H3 fix 2026-04-22.
+                logger.warning(
+                    f"Chat references unknown prompt '{prompt_name}' "
+                    f"— falling back to 'default' and rewriting chat settings."
+                )
+                default_data = prompts.get_prompt('default')
+                default_content = default_data.get('content', '') if isinstance(default_data, dict) else ''
+                if default_content:
+                    system.llm_chat.set_system_prompt(default_content)
+                    prompts.set_active_preset_name('default')
+                try:
+                    chat_name = system.llm_chat.session_manager.get_active_chat_name()
+                    if chat_name:
+                        system.llm_chat.session_manager.update_chat_settings(
+                            chat_name, {"prompt": "default"}
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not rewrite chat.prompt after fallback: {e}")
+                try:
+                    from core.event_bus import publish, Events
+                    publish(Events.SETTINGS_CHANGED, {
+                        "key": "chat_prompt_fallback",
+                        "value": "default",
+                        "reason": f"missing:{prompt_name}",
+                    })
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Error applying prompt settings: {e}")
 
-        system.llm_chat.function_manager.set_private_chat(settings.get("private_chat", False))
+    try:
+        # Reset before apply so scopes not present in this chat's settings fall
+        # back to defaults instead of inheriting the previous chat's values.
+        # Matches the pattern used in chat.py, chat_streaming.py, and
+        # continuity/execution_context.py.
+        from core.chat.function_manager import apply_scopes_from_settings, reset_scopes
+        reset_scopes()
+        apply_scopes_from_settings(system.llm_chat.function_manager, settings)
+        # Align RAG scope with the active chat — chat.py/chat_streaming.py set this
+        # per-request, but routes that only activate a chat (no message sent) left
+        # scope_rag pointing at the previous chat's documents.
+        try:
+            chat_name = system.llm_chat.session_manager.get_active_chat_name()
+            if chat_name:
+                system.llm_chat.function_manager.set_rag_scope(f"__rag__:{chat_name}")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Error applying scope settings: {e}")
 
-        if "memory_scope" in settings:
-            scope = settings["memory_scope"]
-            system.llm_chat.function_manager.set_memory_scope(scope if scope != "none" else None)
-        if "goal_scope" in settings:
-            scope = settings["goal_scope"]
-            system.llm_chat.function_manager.set_goal_scope(scope if scope != "none" else None)
-        if "knowledge_scope" in settings:
-            scope = settings["knowledge_scope"]
-            system.llm_chat.function_manager.set_knowledge_scope(scope if scope != "none" else None)
-        if "people_scope" in settings:
-            scope = settings["people_scope"]
-            system.llm_chat.function_manager.set_people_scope(scope if scope != "none" else None)
-        if "email_scope" in settings:
-            scope = settings["email_scope"]
-            system.llm_chat.function_manager.set_email_scope(scope if scope != "none" else None)
-        if "bitcoin_scope" in settings:
-            scope = settings["bitcoin_scope"]
-            system.llm_chat.function_manager.set_bitcoin_scope(scope if scope != "none" else None)
-
+    try:
         if "spice_set" in settings:
             from core.spice_sets import spice_set_manager
             set_name = settings["spice_set"]
@@ -405,26 +533,61 @@ def _apply_chat_settings(system, settings: dict):
                 prompts.invalidate_spice_picks()
                 spice_set_manager.active_name = set_name
                 logger.info(f"Applied spice set: {set_name}")
+    except Exception as e:
+        logger.error(f"Error applying spice set: {e}")
 
+    try:
         toolset_key = "toolset" if "toolset" in settings else "ability" if "ability" in settings else None
         if toolset_key:
             toolset_name = settings[toolset_key]
             system.llm_chat.function_manager.update_enabled_functions([toolset_name])
             logger.info(f"Applied toolset: {toolset_name}")
             publish(Events.TOOLSET_CHANGED, {"name": toolset_name})
-
-        system.llm_chat._update_story_engine()
-
-        if settings.get('story_engine_enabled') is not None:
-            toolset_info = system.llm_chat.function_manager.get_current_toolset_info()
-            publish(Events.TOOLSET_CHANGED, {
-                "name": toolset_info.get("name", "custom"),
-                "action": "story_engine_update",
-                "function_count": toolset_info.get("function_count", 0)
-            })
-
     except Exception as e:
-        logger.error(f"Error applying chat settings: {e}", exc_info=True)
+        logger.error(f"Error applying toolset: {e}")
+
+
+def reapply_if_active(system, domain: str, name: str):
+    """Hot-reload a saveable thing into the active chat's runtime state.
+
+    When a user edits a toolset/prompt/persona that the active chat is
+    currently using, saving the file alone does not refresh the in-memory
+    runtime — function_manager._enabled_tools, current_system_prompt, etc.
+    stay stale until re-activation. This helper closes that gap.
+
+    No-op when the active chat doesn't reference `name`. Wrapped in a broad
+    try/except so a hot-reload failure never breaks the save response.
+
+    Remmi/Zeebs field report 2026-04-23: editing an active toolset to add a
+    newly-registered plugin tool looked like it worked (file saved) but the
+    tool call returned "not currently available" until re-Activate. This
+    makes the edit land on the first save, as users reasonably expect.
+    """
+    try:
+        chat_settings = system.llm_chat.session_manager.get_chat_settings() or {}
+        if chat_settings.get(domain) != name:
+            return
+        if domain == 'toolset':
+            system.llm_chat.function_manager.update_enabled_functions([name])
+            publish(Events.TOOLSET_CHANGED, {"name": name})
+        elif domain == 'prompt':
+            data = prompts.get_prompt(name)
+            content = data.get('content', '') if isinstance(data, dict) else ''
+            if content:
+                system.llm_chat.set_system_prompt(content)
+                publish(Events.PROMPT_CHANGED, {"name": name, "action": "reapplied"})
+        elif domain == 'persona':
+            # Persona is a bundle; rerun the full apply so prompt/toolset/
+            # voice/scopes all sync to the edited persona's settings.
+            from core.personas import persona_manager
+            persona = persona_manager.get(name)
+            if persona:
+                settings = persona.get("settings", {}).copy()
+                settings["persona"] = name
+                _apply_chat_settings(system, settings)
+        logger.info(f"Hot-reload: re-applied {domain} '{name}' to active chat")
+    except Exception as e:
+        logger.warning(f"Hot-reload {domain}='{name}' failed: {e}")
 
 
 # =============================================================================
@@ -436,18 +599,20 @@ from core.routes.tts import router as tts_router
 from core.routes.settings import router as settings_router
 from core.routes.content import router as content_router
 from core.routes.knowledge import router as knowledge_router
-from core.routes.story_engine import router as story_engine_router
 from core.routes.system import router as system_router
 from core.routes.plugins import router as plugins_router
 from core.routes.media import router as media_router
+from core.routes.agents import router as agents_router
+from core.routes.docs import router as docs_router
 
 app.include_router(chat_router)
 app.include_router(tts_router)
 app.include_router(settings_router)
 app.include_router(content_router)
 app.include_router(knowledge_router)
-app.include_router(story_engine_router)
 app.include_router(system_router)
 app.include_router(plugins_router)
 app.include_router(media_router)
+app.include_router(agents_router)
+app.include_router(docs_router)
 

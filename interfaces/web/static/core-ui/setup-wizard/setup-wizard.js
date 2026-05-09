@@ -1,5 +1,6 @@
 // setup-wizard.js - Setup wizard modal orchestrator
 
+import { setupModalClose } from '../../shared/modal.js';
 import { injectSetupStyles } from './setup-styles.js';
 import { getSettings, getWizardStep, setWizardStep, checkProviderStatus } from './setup-api.js';
 import voiceTab from './tabs/voice.js';
@@ -9,6 +10,8 @@ import identityTab from './tabs/identity.js';
 
 const ALL_TABS = [voiceTab, audioTab, llmTab, identityTab];
 const ALL_STEP_NAMES = ['Voice', 'Audio', 'AI Brain', 'Identity'];
+const DOCKER_TABS = [voiceTab, llmTab, identityTab];
+const DOCKER_STEP_NAMES = ['Voice', 'AI Brain', 'Identity'];
 const MANAGED_TABS = [llmTab, identityTab];
 const MANAGED_STEP_NAMES = ['AI Brain', 'Identity'];
 
@@ -43,10 +46,15 @@ class SetupWizard {
       this.completedStep = wizardState.step;
 
       // Managed mode: skip Voice + Audio tabs (router handles those)
+      // Docker mode: skip Audio tab, hide wakeword in Voice tab
       this.managed = wizardState.managed || false;
+      this.docker = wizardState.docker || false;
       if (this.managed) {
         TABS = MANAGED_TABS;
         STEP_NAMES = MANAGED_STEP_NAMES;
+      } else if (this.docker) {
+        TABS = DOCKER_TABS;
+        STEP_NAMES = DOCKER_STEP_NAMES;
       } else {
         TABS = ALL_TABS;
         STEP_NAMES = ALL_STEP_NAMES;
@@ -62,6 +70,8 @@ class SetupWizard {
       this.settings = {};
       this.initialSettings = {};
       this.completedStep = 0;
+      TABS = ALL_TABS;
+      STEP_NAMES = ALL_STEP_NAMES;
     }
 
     // If wizard is complete and not forced, don't show
@@ -71,7 +81,7 @@ class SetupWizard {
     }
 
     // Start at first incomplete step
-    this.currentStep = Math.min(this.completedStep, 3);
+    this.currentStep = Math.min(this.completedStep, TABS.length - 1);
 
     this.render();
     this.attachEventListeners();
@@ -142,7 +152,7 @@ class SetupWizard {
     if (!container) return;
 
     // Render tab content
-    const html = await tab.render(this.settings, { managed: this.managed });
+    const html = await tab.render(this.settings, { managed: this.managed, docker: this.docker });
     container.innerHTML = html;
 
     // Attach tab-specific listeners
@@ -175,28 +185,16 @@ class SetupWizard {
       });
     });
 
-    // Close on overlay click (with warning)
-    this.modal.addEventListener('click', (e) => {
-      if (e.target === this.modal) {
-        this.confirmClose();
-      }
-    });
-
-    // ESC key
-    this.escHandler = (e) => {
-      if (e.key === 'Escape') {
-        this.confirmClose();
-      }
-    };
-    document.addEventListener('keydown', this.escHandler);
+    // Close on overlay click + ESC (with warning)
+    this._cleanupModal = setupModalClose(this.modal, () => this.confirmClose());
   }
 
   async handleNext() {
     const tab = TABS[this.currentStep];
     
-    // Validate current step
+    // Validate current step (may be async for saves before advancing)
     if (tab.validate) {
-      const result = tab.validate(this.settings);
+      const result = await tab.validate(this.settings);
       if (!result.valid) {
         this.showValidationError(result.message);
         return;
@@ -383,7 +381,8 @@ class SetupWizard {
     }
 
     try {
-      const res = await fetch('/api/system/restart', { method: 'POST' });
+      const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+      const res = await fetch('/api/system/restart', { method: 'POST', headers: { 'X-CSRF-Token': csrf } });
       if (res.ok) {
         // Show restarting message
         const content = this.modal.querySelector('.setup-wizard-content');
@@ -517,7 +516,7 @@ class SetupWizard {
   close() {
     if (!this.modal) return; // Already closed
     
-    document.removeEventListener('keydown', this.escHandler);
+    if (this._cleanupModal) this._cleanupModal();
     
     this.modal.classList.remove('active');
     

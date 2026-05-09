@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 
 import config
 from core.auth import require_login
-from core.api_fastapi import get_system, _apply_chat_settings, PROJECT_ROOT
+from core.api_fastapi import get_system, _apply_chat_settings, PROJECT_ROOT, reapply_if_active
 from core.event_bus import publish, Events
 from core import prompts
 
@@ -89,14 +89,16 @@ async def get_prompt(name: str, request: Request, _=Depends(require_login)):
 
 
 @router.put("/api/prompts/{name}")
-async def save_prompt(name: str, request: Request, _=Depends(require_login)):
+async def save_prompt(name: str, request: Request, _=Depends(require_login), system=Depends(get_system)):
     """Save a prompt."""
     data = await request.json()
-    if prompts.save_prompt(name, data):
+    success, msg = prompts.save_prompt(name, data)
+    if success:
         publish(Events.PROMPT_CHANGED, {"name": name, "action": "saved"})
+        reapply_if_active(system, 'prompt', name)
         return {"status": "success", "name": name}
     else:
-        raise HTTPException(status_code=500, detail="Failed to save prompt")
+        raise HTTPException(status_code=400, detail=msg or "Failed to save prompt")
 
 
 @router.delete("/api/prompts/{name}")
@@ -294,7 +296,7 @@ async def enable_functions(request: Request, _=Depends(require_login), system=De
 
 
 @router.post("/api/toolsets/custom")
-async def save_custom_toolset(request: Request, _=Depends(require_login)):
+async def save_custom_toolset(request: Request, _=Depends(require_login), system=Depends(get_system)):
     """Save a custom toolset."""
     from core.toolsets import toolset_manager
     data = await request.json()
@@ -303,6 +305,7 @@ async def save_custom_toolset(request: Request, _=Depends(require_login)):
     if not name:
         raise HTTPException(status_code=400, detail="Name required")
     if toolset_manager.save_toolset(name, functions):
+        reapply_if_active(system, 'toolset', name)
         return {"status": "success", "name": name}
     else:
         raise HTTPException(status_code=500, detail="Failed to save toolset")
@@ -394,6 +397,20 @@ async def rename_spice_category(name: str, request: Request, _=Depends(require_l
         prompts.prompt_manager._spice_meta[new_name] = prompts.prompt_manager._spice_meta.pop(name)
     prompts.prompt_manager.save_spices()
     return {"status": "success", "old_name": name, "new_name": new_name}
+
+
+@router.post("/api/spices/category/{name}/emoji")
+async def set_spice_category_emoji(name: str, request: Request, _=Depends(require_login)):
+    """Set emoji for a spice category."""
+    data = await request.json()
+    emoji = data.get('emoji', '')
+    if name not in prompts.prompt_manager._spices:
+        raise HTTPException(status_code=404, detail=f"Category '{name}' not found")
+    meta = prompts.prompt_manager._spice_meta.get(name, {})
+    meta['emoji'] = emoji
+    prompts.prompt_manager._spice_meta[name] = meta
+    prompts.prompt_manager.save_spices()
+    return {"status": "success", "name": name, "emoji": emoji}
 
 
 @router.post("/api/spices/category/{name}/toggle")
@@ -519,7 +536,7 @@ async def clear_default_persona(request: Request, _=Depends(require_login)):
 
 
 @router.put("/api/personas/{name}")
-async def update_persona(name: str, request: Request, _=Depends(require_login)):
+async def update_persona(name: str, request: Request, _=Depends(require_login), system=Depends(get_system)):
     """Update an existing persona."""
     from core.personas import persona_manager
     if not persona_manager.exists(name):
@@ -527,6 +544,7 @@ async def update_persona(name: str, request: Request, _=Depends(require_login)):
     data = await request.json()
     if not persona_manager.update(name, data):
         raise HTTPException(status_code=500, detail="Failed to update persona")
+    reapply_if_active(system, 'persona', name)
     return {"status": "success"}
 
 
@@ -554,24 +572,50 @@ async def duplicate_persona(name: str, request: Request, _=Depends(require_login
 
 @router.post("/api/personas/{name}/avatar")
 async def upload_persona_avatar(name: str, request: Request, file: UploadFile = File(...), _=Depends(require_login)):
-    """Upload avatar image for a persona (max 4MB)."""
+    """Upload avatar image for a persona (max 4MB). Auto-resized to 512x512 webp."""
     from core.personas import persona_manager
     if not persona_manager.exists(name):
         raise HTTPException(status_code=404, detail="Persona not found")
 
-    data = await file.read()
-    if len(data) > 4 * 1024 * 1024:
+    raw = await file.read()
+    if len(raw) > 4 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Avatar too large (max 4MB)")
 
-    # Determine extension from content type
-    content_type = file.content_type or ''
-    ext_map = {'image/webp': '.webp', 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif'}
-    ext = ext_map.get(content_type, '.webp')
-    filename = f"{name}{ext}"
+    # Resize to 512x512 square (center crop) and convert to webp
+    data = _process_avatar(raw)
+    filename = f"{name}.webp"
 
     if not persona_manager.set_avatar(name, filename, data):
         raise HTTPException(status_code=500, detail="Failed to save avatar")
     return {"status": "success", "avatar": filename}
+
+
+def _process_avatar(raw: bytes, size: int = 512) -> bytes:
+    """Resize image to square webp. Center-crops to avoid distortion."""
+    import io
+    from PIL import Image
+
+    # Guard against decompression bombs
+    Image.MAX_IMAGE_PIXELS = 4096 * 4096
+
+    img = Image.open(io.BytesIO(raw))
+    img = img.convert("RGBA") if img.mode == "RGBA" else img.convert("RGB")
+
+    # Center crop to square
+    w, h = img.size
+    if w != h:
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+
+    # Resize to target
+    if img.size[0] != size:
+        img = img.resize((size, size), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", quality=85)
+    return buf.getvalue()
 
 
 @router.delete("/api/personas/{name}/avatar")
@@ -605,10 +649,16 @@ async def load_persona(name: str, request: Request, _=Depends(require_login), sy
     settings["persona"] = name
     # Reset scope keys to defaults if persona doesn't specify them,
     # otherwise old persona's scopes persist through dict merge
-    for key in ("memory_scope", "goal_scope", "knowledge_scope", "people_scope",
-                "email_scope", "bitcoin_scope"):
+    from core.chat.function_manager import scope_setting_keys
+    for key in scope_setting_keys():
         if key not in settings:
             settings[key] = "default"
+    # scope_setting_keys() excludes 'private_chat' (it's a bool scope, not
+    # in the dropdown-facing list). Reset it here so loading a persona that
+    # doesn't explicitly set private_chat turns it OFF — otherwise a chat
+    # that was marked private stays private silently after persona switch.
+    if "private_chat" not in settings:
+        settings["private_chat"] = False
     session_manager = system.llm_chat.session_manager
     session_manager.update_chat_settings(settings)
 
@@ -632,6 +682,194 @@ async def create_persona_from_chat(request: Request, _=Depends(require_login), s
     if not persona_manager.create_from_settings(name, chat_settings):
         raise HTTPException(status_code=409, detail="Persona already exists or invalid name")
     return {"status": "success", "name": persona_manager._sanitize_name(name)}
+
+
+# =============================================================================
+# PERSONA IMPORT/EXPORT
+# =============================================================================
+
+@router.get("/api/personas/{name}/export")
+async def export_persona(name: str, request: Request, _=Depends(require_login)):
+    """Export persona as a portable JSON bundle (persona + prompt + avatar)."""
+    import base64
+    from datetime import datetime, timezone
+    from core.personas import persona_manager
+    from core.prompt_crud import get_prompt
+    from core.prompt_manager import prompt_manager
+
+    persona = persona_manager.get(name)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+
+    settings = persona.get("settings", {})
+
+    # Build export bundle
+    bundle = {
+        "sapphire_export": True,
+        "type": "persona",
+        "version": 1,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "name": name,
+        "tagline": persona.get("tagline", ""),
+        "trim_color": settings.get("trim_color", ""),
+        "voice": {
+            "voice": settings.get("voice", ""),
+            "speed": settings.get("speed", 1.0),
+            "pitch": settings.get("pitch", 1.0),
+        },
+    }
+
+    # Include prompt data (same shape as prompt export)
+    prompt_name = settings.get("prompt", "")
+    if prompt_name and prompt_name != "__story__":
+        prompt_data = get_prompt(prompt_name)
+        if prompt_data:
+            prompt_export = dict(prompt_data)
+            # Strip computed fields
+            for k in ("content", "compiled", "char_count", "token_count"):
+                if prompt_export.get("type") == "assembled" and k == "content":
+                    prompt_export.pop(k, None)
+                elif k != "content":
+                    prompt_export.pop(k, None)
+            bundle["prompt"] = {"name": prompt_name, "data": prompt_export}
+
+            # Include components used by assembled prompts
+            if prompt_data.get("type") == "assembled" and prompt_data.get("components"):
+                used = {}
+                for comp_type, comp_key in prompt_data["components"].items():
+                    if isinstance(comp_key, str) and comp_key:
+                        pieces = prompt_manager.components.get(comp_type, {})
+                        if comp_key in pieces:
+                            used.setdefault(comp_type, {})[comp_key] = pieces[comp_key]
+                    elif isinstance(comp_key, list):
+                        for ck in comp_key:
+                            pieces = prompt_manager.components.get(comp_type, {})
+                            if ck in pieces:
+                                used.setdefault(comp_type, {})[ck] = pieces[ck]
+                if used:
+                    bundle["components"] = used
+
+    # Include avatar as base64
+    avatar_path = persona_manager.get_avatar_path(name)
+    if avatar_path and avatar_path.exists():
+        avatar_data = avatar_path.read_bytes()
+        ext = avatar_path.suffix.lstrip('.')
+        mime = {'webp': 'image/webp', 'png': 'image/png', 'jpg': 'image/jpeg', 'gif': 'image/gif'}.get(ext, 'image/webp')
+        bundle["avatar"] = f"data:{mime};base64,{base64.b64encode(avatar_data).decode()}"
+    else:
+        bundle["avatar"] = None
+
+    return bundle
+
+
+@router.post("/api/personas/import")
+async def import_persona(request: Request, _=Depends(require_login)):
+    """Import a persona from a portable JSON bundle."""
+    import base64
+    from core.personas import persona_manager
+    from core.prompt_crud import get_prompt, save_prompt
+    from core.prompt_manager import prompt_manager
+
+    data = await request.json()
+
+    # Validate
+    if not data.get("sapphire_export") or data.get("type") != "persona":
+        raise HTTPException(status_code=400, detail="Invalid persona export format")
+
+    name = data.get("name", "imported")
+    overwrite_prompt = data.get("overwrite_prompt", False)
+    overwrite_avatar = data.get("overwrite_avatar", False)
+
+    # Check persona name collision (frontend handles rename prompt)
+    if persona_manager.exists(name):
+        raise HTTPException(status_code=409, detail=f"Persona '{name}' already exists")
+
+    # Import prompt + components first
+    prompt_name = None
+    if data.get("prompt"):
+        prompt_info = data["prompt"]
+        if not isinstance(prompt_info, dict):
+            raise HTTPException(status_code=400, detail="Invalid prompt data format")
+        prompt_name = prompt_info.get("name", name)
+        prompt_data = prompt_info.get("data", {})
+        if not isinstance(prompt_data, dict):
+            raise HTTPException(status_code=400, detail="Invalid prompt data")
+
+        # Validate required fields based on type
+        prompt_type = prompt_data.get("type", "assembled")
+        if prompt_type == "monolith" and "content" not in prompt_data:
+            raise HTTPException(status_code=400, detail="Monolith prompt requires 'content' field")
+
+        existing = get_prompt(prompt_name)
+        if existing and not overwrite_prompt:
+            # Don't overwrite — use existing prompt by name
+            logger.info(f"[IMPORT] Prompt '{prompt_name}' exists, keeping existing")
+        else:
+            # Import components if present
+            if data.get("components"):
+                components = data["components"]
+                if not isinstance(components, dict):
+                    raise HTTPException(status_code=400, detail="Invalid components format")
+                for comp_type, defs in components.items():
+                    if not isinstance(defs, dict):
+                        continue
+                    for key, value in defs.items():
+                        existing_piece = prompt_manager.components.get(comp_type, {}).get(key)
+                        if existing_piece and not overwrite_prompt:
+                            continue
+                        prompt_manager.components.setdefault(comp_type, {})[key] = value
+                prompt_manager.save_components()
+
+            # Save prompt
+            save_prompt(prompt_name, prompt_data, allow_overwrite=overwrite_prompt)
+            logger.info(f"[IMPORT] Saved prompt '{prompt_name}'")
+
+    # Build persona settings
+    voice_data = data.get("voice", {})
+    persona_settings = {}
+    if prompt_name:
+        persona_settings["prompt"] = prompt_name
+    if voice_data.get("voice"):
+        persona_settings["voice"] = voice_data["voice"]
+    if "speed" in voice_data:
+        persona_settings["speed"] = voice_data["speed"]
+    if "pitch" in voice_data:
+        persona_settings["pitch"] = voice_data["pitch"]
+    if data.get("trim_color"):
+        persona_settings["trim_color"] = data["trim_color"]
+
+    # Create persona
+    persona_data = {
+        "name": name,
+        "tagline": data.get("tagline", ""),
+        "settings": persona_settings,
+    }
+    if not persona_manager.create(name, persona_data):
+        raise HTTPException(status_code=500, detail="Failed to create persona")
+
+    # Import avatar
+    if data.get("avatar") and isinstance(data["avatar"], str) and data["avatar"].startswith("data:"):
+        existing_avatar = persona_manager.get_avatar_path(name)
+        if existing_avatar and not overwrite_avatar:
+            logger.info(f"[IMPORT] Avatar exists for '{name}', keeping existing")
+        else:
+            try:
+                # Parse data URI: data:image/webp;base64,XXXX
+                header, b64data = data["avatar"].split(",", 1)
+                if len(b64data) > 5 * 1024 * 1024:  # 5MB base64 ≈ 3.75MB decoded
+                    raise ValueError("Avatar data too large")
+                mime = header.split(":")[1].split(";")[0]
+                if mime not in ('image/webp', 'image/png', 'image/jpeg', 'image/gif'):
+                    raise ValueError(f"Unsupported image type: {mime}")
+                avatar_bytes = _process_avatar(base64.b64decode(b64data))
+                filename = f"{persona_manager._sanitize_name(name)}.webp"
+                persona_manager.set_avatar(persona_manager._sanitize_name(name), filename, avatar_bytes)
+                logger.info(f"[IMPORT] Saved avatar for '{name}' ({len(avatar_bytes)} bytes)")
+            except Exception as e:
+                logger.warning(f"[IMPORT] Failed to import avatar: {e}")
+
+    sanitized = persona_manager._sanitize_name(name)
+    return {"status": "success", "name": sanitized}
 
 
 # =============================================================================

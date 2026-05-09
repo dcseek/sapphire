@@ -2,9 +2,11 @@
 """
 Email tool — AI can read inbox and send email to whitelisted contacts.
 Privacy-first: AI never sees email addresses in get_inbox/get_recipients.
-Uses IMAP for reading, SMTP for sending. Gmail app passwords recommended.
+Uses IMAP for reading, SMTP for sending.
+Supports password auth and OAuth2 (XOAUTH2) for O365/Exchange.
 """
 
+import base64
 import imaplib
 import smtplib
 import email
@@ -28,24 +30,33 @@ AVAILABLE_FUNCTIONS = [
     'send_email',
 ]
 
+def _allow_all_enabled():
+    """Check if allow_all_recipients setting is on."""
+    try:
+        from core.plugin_loader import plugin_loader
+        settings = plugin_loader.get_plugin_settings("email")
+        return bool(settings.get("allow_all_recipients", False))
+    except Exception:
+        return False
+
 TOOLS = [
     {
         "type": "function",
         "is_local": True,
         "function": {
             "name": "get_inbox",
-            "description": "Fetch the latest emails from a mail folder. Returns names, subjects, and dates. Use read_email(index) to read full content.",
+            "description": "Latest emails from a folder. Returns names, subjects, dates. Use read_email(index) for full content.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "count": {
                         "type": "integer",
-                        "description": "Number of recent emails to fetch (default 20, max 50)"
+                        "description": "How many (default 20, max 50)"
                     },
                     "folder": {
                         "type": "string",
                         "enum": ["inbox", "sent", "archive"],
-                        "description": "Which mail folder to view (default: inbox)"
+                        "description": "Default inbox"
                     }
                 },
                 "required": []
@@ -57,13 +68,13 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "read_email",
-            "description": "Read the full content of an email by its index from the last get_inbox() call.",
+            "description": "Read full email by index from last get_inbox().",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "index": {
                         "type": "integer",
-                        "description": "Email index from get_inbox() results (1-based)"
+                        "description": "Index from get_inbox() (1-based)"
                     }
                 },
                 "required": ["index"]
@@ -75,14 +86,14 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "archive_emails",
-            "description": "Archive emails by their index numbers from the last get_inbox() call. Moves them to an Archive folder (not deleted — recoverable). Clears inbox cache so next get_inbox() reflects changes.",
+            "description": "Archive emails by index (from last get_inbox). Moves to Archive — recoverable.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "indices": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "List of email indices to archive (1-based, from get_inbox)"
+                        "description": "Indices to archive (1-based)"
                     }
                 },
                 "required": ["indices"]
@@ -94,7 +105,7 @@ TOOLS = [
         "is_local": True,
         "function": {
             "name": "get_recipients",
-            "description": "List contacts who are whitelisted for email. Returns IDs and names only (no addresses). Use the ID with send_email().",
+            "description": "Whitelisted email contacts (ids + names, no addresses). Use id with send_email.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -102,37 +113,46 @@ TOOLS = [
             }
         }
     },
-    {
-        "type": "function",
-        "is_local": True,
-        "function": {
-            "name": "send_email",
-            "description": "Send an email to a whitelisted contact, or reply to an inbox message. For new emails use recipient_id. For replies use reply_to_index (from get_inbox) — the recipient is resolved from the original message automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "recipient_id": {
-                        "type": "integer",
-                        "description": "Contact ID from get_recipients() — required for new emails, omit when replying"
-                    },
-                    "reply_to_index": {
-                        "type": "integer",
-                        "description": "Email index from get_inbox() to reply to — sets recipient, subject, and threading headers automatically"
-                    },
-                    "subject": {
-                        "type": "string",
-                        "description": "Email subject (auto-set to 'Re: ...' when replying)"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Email body text"
-                    }
-                },
-                "required": ["body"]
-            }
+]
+
+# Build send_email schema — always include address param, runtime check gates it
+_send_props = {
+    "recipient_id": {
+        "type": "integer",
+        "description": "Contact id from get_recipients()"
+    },
+    "reply_to_index": {
+        "type": "integer",
+        "description": "Inbox index from get_inbox() — auto-sets recipient / subject / thread headers"
+    },
+    "subject": {
+        "type": "string",
+        "description": "Subject (auto-'Re: ...' on reply)"
+    },
+    "body": {
+        "type": "string",
+        "description": "Body text"
+    },
+    "address": {
+        "type": "string",
+        "description": "Direct email address. Requires allow-all-recipients setting. Not with recipient_id."
+    },
+}
+_send_desc = "Send an email. One of recipient_id / reply_to_index / address is required.\n  recipient_id=N — to a contact (from get_recipients)\n  reply_to_index=N — reply to inbox entry (from get_inbox)\n  address='x@y' — direct (requires allow-all)"
+
+TOOLS.append({
+    "type": "function",
+    "is_local": True,
+    "function": {
+        "name": "send_email",
+        "description": _send_desc,
+        "parameters": {
+            "type": "object",
+            "properties": _send_props,
+            "required": ["body"]
         }
     }
-]
+})
 
 # ─── Inbox Cache (per-scope) ──────────────────────────────────────────────────
 
@@ -308,16 +328,142 @@ def _get_current_email_scope():
     except Exception:
         return None
 
+def _get_email_creds_detailed():
+    """Like _get_email_creds but returns (creds, error_detail).
+
+    error_detail is None when creds were found, or a human-facing string
+    explaining what's wrong. Used by send_email to distinguish "never set
+    up" from "OAuth refresh just failed" — because user-facing retry of
+    OAuth setup on a transient refresh failure would OVERWRITE a valid
+    refresh_token with a fresh consent cycle. Day-ruiner H8 2026-04-22.
+    """
+    from core.credentials_manager import credentials
+    scope = _get_current_email_scope()
+    if scope is None:
+        return None, "Email is disabled for this chat."
+    creds = credentials.get_email_account(scope)
+    if not creds.get('address'):
+        return None, "Email not configured. Set up credentials in Settings → Plugins → Email."
+    if creds.get('auth_type') == 'oauth2':
+        if not creds.get('oauth_refresh_token'):
+            return None, "OAuth refresh token missing. Re-authorize in Settings → Plugins → Email."
+        if creds.get('oauth_expires_at', 0) < time.time() + 300:
+            refreshed = _refresh_oauth_token(scope, creds)
+            if not refreshed:
+                return None, (
+                    "OAuth token refresh FAILED. Your existing credentials MAY still be valid — "
+                    "do NOT re-run OAuth setup yet (would overwrite the existing refresh token with "
+                    "a fresh consent cycle). Check network connectivity or the provider's status and "
+                    "try again in a moment. Check server logs for the provider's error response if "
+                    "this repeats."
+                )
+            creds = refreshed
+        return creds, None
+    # Password auth
+    if not creds.get('app_password'):
+        return None, "App password not set. Configure it in Settings → Plugins → Email."
+    return creds, None
+
+
 def _get_email_creds():
-    """Get email credentials for current scope."""
+    """Get email credentials for current scope. Refreshes OAuth tokens if needed."""
     from core.credentials_manager import credentials
     scope = _get_current_email_scope()
     if scope is None:
         return None
     creds = credentials.get_email_account(scope)
-    if not creds['address'] or not creds['app_password']:
+    if not creds['address']:
+        return None
+    if creds.get('auth_type') == 'oauth2':
+        if not creds.get('oauth_refresh_token'):
+            return None
+        # Refresh token if expired or expiring within 5 minutes
+        if creds.get('oauth_expires_at', 0) < time.time() + 300:
+            creds = _refresh_oauth_token(scope, creds)
+            if not creds:
+                return None
+        return creds
+    # Password auth
+    if not creds.get('app_password'):
         return None
     return creds
+
+
+def _refresh_oauth_token(scope, creds):
+    """Refresh an OAuth2 access token inline. Returns updated creds or None."""
+    import requests as http_requests
+    from core.credentials_manager import credentials
+
+    tenant = creds.get('oauth_tenant_id', 'common')
+    token_url = f'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token'
+
+    try:
+        resp = http_requests.post(token_url, data={
+            'client_id': creds['oauth_client_id'],
+            'client_secret': creds['oauth_client_secret'],
+            'refresh_token': creds['oauth_refresh_token'],
+            'grant_type': 'refresh_token',
+            'scope': 'https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send offline_access',
+        }, timeout=15)
+
+        if resp.status_code != 200:
+            logger.error(f"[EMAIL] OAuth token refresh failed: {resp.status_code} {resp.text[:200]}")
+            return None
+
+        tokens = resp.json()
+        access_token = tokens['access_token']
+        expires_at = time.time() + tokens.get('expires_in', 3600)
+        new_refresh = tokens.get('refresh_token', '')
+
+        credentials.update_email_oauth_tokens(scope, access_token, expires_at, new_refresh)
+
+        creds['oauth_access_token'] = access_token
+        creds['oauth_expires_at'] = expires_at
+        if new_refresh:
+            creds['oauth_refresh_token'] = new_refresh
+        logger.info(f"[EMAIL] OAuth token refreshed for scope '{scope}'")
+        return creds
+    except Exception as e:
+        logger.error(f"[EMAIL] OAuth token refresh error: {e}")
+        return None
+
+
+def _build_xoauth2(user, access_token):
+    """Build XOAUTH2 authentication string."""
+    return f"user={user}\x01auth=Bearer {access_token}\x01\x01"
+
+
+def _imap_connect(creds):
+    """Connect and authenticate to IMAP. Handles both password and OAuth2."""
+    imap = imaplib.IMAP4_SSL(creds['imap_server'], int(creds.get('imap_port', 993)))
+    if creds.get('auth_type') == 'oauth2':
+        auth_string = _build_xoauth2(creds['address'], creds['oauth_access_token'])
+        imap.authenticate('XOAUTH2', lambda x: auth_string.encode())
+    else:
+        imap.login(creds['address'], creds['app_password'])
+    return imap
+
+
+def _smtp_connect(creds):
+    """Connect and authenticate to SMTP. Handles both password and OAuth2."""
+    smtp_port = int(creds.get('smtp_port', 465))
+    if smtp_port == 465:
+        smtp = smtplib.SMTP_SSL(creds['smtp_server'], smtp_port)
+    else:
+        smtp = smtplib.SMTP(creds['smtp_server'], smtp_port)
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+
+    if creds.get('auth_type') == 'oauth2':
+        auth_string = _build_xoauth2(creds['address'], creds['oauth_access_token'])
+        encoded = base64.b64encode(auth_string.encode()).decode()
+        code, msg = smtp.docmd('AUTH', f'XOAUTH2 {encoded}')
+        if code not in (235, 250):
+            raise smtplib.SMTPAuthenticationError(code, msg)
+    else:
+        smtp.login(creds['address'], creds['app_password'])
+    return smtp
 
 
 # ─── Tool Implementations ────────────────────────────────────────────────────
@@ -343,8 +489,7 @@ def _get_inbox(count=20, folder="inbox"):
         return "Email not configured. Set up email credentials in Settings → Plugins → Email.", False
 
     try:
-        imap = imaplib.IMAP4_SSL(creds['imap_server'], int(creds.get('imap_port', 993)))
-        imap.login(creds['address'], creds['app_password'])
+        imap = _imap_connect(creds)
 
         # Resolve IMAP folder name (also selects it)
         imap_folder = _resolve_folder(imap, folder)
@@ -415,9 +560,13 @@ def _get_inbox(count=20, folder="inbox"):
 
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP error: {e}")
+        try: imap.logout()
+        except Exception: pass
         return f"Email login failed — check credentials. Error: {e}", False
     except Exception as e:
         logger.error(f"Email {folder} error: {e}", exc_info=True)
+        try: imap.logout()
+        except Exception: pass
         return f"Failed to fetch {folder}: {e}", False
 
 
@@ -451,7 +600,7 @@ def _read_email(index):
         return f"Invalid index {index}. Range: 1-{len(cache['raw'])}.", False
 
     msg = cache["raw"][index - 1]
-    sender = msg.get('From', 'Unknown')
+    sender = _extract_sender_name(msg.get('From', 'Unknown'))
     subject = _decode_header_value(msg.get('Subject', '(no subject)'))
     date_str = msg.get('Date', '?')
     body = _extract_body(msg)
@@ -477,8 +626,7 @@ def _mark_as_read(index):
     if not creds:
         return
     try:
-        imap = imaplib.IMAP4_SSL(creds['imap_server'], int(creds.get('imap_port', 993)))
-        imap.login(creds['address'], creds['app_password'])
+        imap = _imap_connect(creds)
         imap.select('INBOX')  # read-write
         imap.uid('store', cache["msg_ids"][index - 1], '+FLAGS', '\\Seen')
         imap.logout()
@@ -488,6 +636,8 @@ def _mark_as_read(index):
         logger.info(f"Email [{index}] marked as read")
     except Exception as e:
         logger.warning(f"Failed to mark email as read: {e}")
+        try: imap.logout()
+        except Exception: pass
 
 
 def _archive_emails(indices):
@@ -510,8 +660,7 @@ def _archive_emails(indices):
         return "Email not configured.", False
 
     try:
-        imap = imaplib.IMAP4_SSL(creds['imap_server'], int(creds.get('imap_port', 993)))
-        imap.login(creds['address'], creds['app_password'])
+        imap = _imap_connect(creds)
 
         # Create Archive folder (no-op if exists)
         imap.create('Archive')
@@ -519,12 +668,30 @@ def _archive_emails(indices):
         imap.select('INBOX')  # read-write
 
         archived = []
+        # Track which UIDs actually moved vs which the server rejected.
+        # Pre-2026-04-22 archive_emails always reported "Archived N" even when
+        # the server's COPY returned NO (e.g. message was already archived
+        # externally, so the UID no longer exists in INBOX). That's a lie to
+        # the user — and if the user acted on it (deleted from phone trusting
+        # Sapphire's archive succeeded), they'd lose the message. Day-ruiner
+        # H10. Check IMAP response codes instead of blind proceed.
+        archived = []
+        skipped = []  # [(idx, subject, reason)]
         for idx in sorted(set(indices)):
             uid = cache["msg_ids"][idx - 1]
             subject = cache["messages"][idx - 1]["subject"] if idx <= len(cache["messages"]) else "?"
-            imap.uid('copy', uid, 'Archive')
-            imap.uid('store', uid, '+FLAGS', '\\Deleted')
-            archived.append(f"[{idx}] {subject}")
+            try:
+                copy_status, _ = imap.uid('copy', uid, 'Archive')
+                if copy_status != 'OK':
+                    skipped.append((idx, subject, f"copy returned {copy_status!r} (message may already be archived externally)"))
+                    continue
+                store_status, _ = imap.uid('store', uid, '+FLAGS', '\\Deleted')
+                if store_status != 'OK':
+                    skipped.append((idx, subject, f"flag-delete returned {store_status!r}"))
+                    continue
+                archived.append(f"[{idx}] {subject}")
+            except Exception as e:
+                skipped.append((idx, subject, f"exception: {type(e).__name__}: {e}"))
 
         imap.expunge()
         imap.logout()
@@ -532,50 +699,114 @@ def _archive_emails(indices):
         # Invalidate cache so next get_inbox() is fresh
         _reset_cache()
 
-        logger.info(f"Archived {len(archived)} emails")
-        lines = [f"Archived {len(archived)} emails:"]
-        lines.extend(f"  {a}" for a in archived)
-        return '\n'.join(lines), True
+        if not archived and not skipped:
+            return "No emails to archive.", False
+
+        lines = []
+        if archived:
+            logger.info(f"Archived {len(archived)} emails")
+            lines.append(f"Archived {len(archived)} email{'s' if len(archived) != 1 else ''}:")
+            lines.extend(f"  {a}" for a in archived)
+        if skipped:
+            logger.warning(f"Archive: {len(skipped)} skipped: {[s[0] for s in skipped]}")
+            if archived:
+                lines.append("")
+            lines.append(f"Skipped {len(skipped)} email{'s' if len(skipped) != 1 else ''} (likely already archived elsewhere):")
+            lines.extend(f"  [{idx}] {subj} — {reason}" for idx, subj, reason in skipped)
+
+        # Partial success is still "ok" for the tool caller, but with visible
+        # skipped reporting. Full failure (nothing archived) returns False.
+        return '\n'.join(lines), bool(archived)
 
     except Exception as e:
         logger.error(f"Archive error: {e}", exc_info=True)
+        try: imap.logout()
+        except Exception: pass
         return f"Failed to archive: {e}", False
 
 
 def _get_recipients():
-    from functions.knowledge import get_people
+    from plugins.memory.tools.knowledge_tools import get_people
+
+    allow_all = _allow_all_enabled()
 
     people_scope = _get_current_people_scope()
-    if people_scope is None:
+    if people_scope is None and not allow_all:
         return "People contacts are disabled for this chat.", False
 
-    people = get_people(people_scope)
-    whitelisted = [p for p in people if p.get('email_whitelisted') and p.get('email')]
+    lines = []
 
-    if not whitelisted:
+    if people_scope is not None:
+        people = get_people(people_scope)
+        if allow_all:
+            contacts = [p for p in people if p.get('email')]
+        else:
+            contacts = [p for p in people if p.get('email_whitelisted') and p.get('email')]
+
+        if contacts:
+            lines.append("Available contacts:")
+            for p in contacts:
+                lines.append(f"  [{p['id']}] {p['name']}")
+
+    if allow_all:
+        lines.append("\nDirect addresses enabled — you can also use the 'address' parameter with any email address.")
+
+    if not lines:
         return "No contacts are whitelisted for email. Add contacts in Mind → People and enable 'Allow email'.", False
 
-    lines = ["Available email recipients:"]
-    for p in whitelisted:
-        lines.append(f"  [{p['id']}] {p['name']}")
     return '\n'.join(lines), True
 
 
-def _send_email(recipient_id=None, subject=None, body='', reply_to_index=None):
-    creds = _get_email_creds()
+def _send_email(recipient_id=None, subject=None, body='', reply_to_index=None, address=None):
+    # Target-mode mutex. Pre-2026-04-22 the precedence was
+    # `address > reply_to_index > recipient_id`, which meant if the AI
+    # passed both `recipient_id` and `reply_to_index` (confused or trying
+    # to combine intents), reply_to_index silently won and the email went
+    # to whoever sent that inbox entry — NOT to the contact the caller
+    # named. Day-ruiner H4 — wrong-recipient silent failure with
+    # potentially sensitive body content quoted. Fix: require exactly one
+    # target mode and refuse ambiguous calls loudly.
+    target_modes = sum([
+        bool(address),
+        reply_to_index is not None,
+        recipient_id is not None,
+    ])
+    if target_modes > 1:
+        return (
+            "Multiple recipient modes passed. Use EXACTLY ONE of "
+            "address, recipient_id, or reply_to_index.",
+            False,
+        )
+    if target_modes == 0:
+        return (
+            "No recipient specified. Pass one of recipient_id (from "
+            "get_recipients), reply_to_index (from get_inbox), or "
+            "address (requires allow-all-recipients).",
+            False,
+        )
+
+    creds, creds_error = _get_email_creds_detailed()
     if not creds:
-        scope = _get_current_email_scope()
-        if scope is None:
-            return "Email is disabled for this chat.", False
-        return "Email not configured. Set up email credentials in Settings → Plugins → Email.", False
+        return creds_error or "Email not configured.", False
 
     cache = _get_cache()
     reply_headers = {}
     to_addr = None
     to_name = None
 
+    # Direct address mode (allow-all only)
+    if address is not None:
+        if not _allow_all_enabled():
+            return "Direct email addresses are not allowed. Use recipient_id from get_recipients() instead.", False
+        to_addr = address.strip()
+        to_name = to_addr
+        if not subject:
+            return "subject is required for new emails.", False
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', to_addr):
+            return f"Invalid email address: {to_addr}", False
+
     # Reply mode — resolve recipient + headers from cached message
-    if reply_to_index is not None:
+    elif reply_to_index is not None:
         if not cache["raw"]:
             return "No inbox loaded. Call get_inbox() first.", False
         if reply_to_index < 1 or reply_to_index > len(cache["raw"]):
@@ -611,7 +842,7 @@ def _send_email(recipient_id=None, subject=None, body='', reply_to_index=None):
 
     # New email mode — resolve from whitelisted contacts
     elif recipient_id is not None:
-        from functions.knowledge import get_people
+        from plugins.memory.tools.knowledge_tools import get_people
 
         people_scope = _get_current_people_scope()
         if people_scope is None:
@@ -644,14 +875,8 @@ def _send_email(recipient_id=None, subject=None, body='', reply_to_index=None):
         for k, v in reply_headers.items():
             msg[k] = v
 
-        smtp_port = int(creds.get('smtp_port', 465))
-        if smtp_port == 465:
-            smtp = smtplib.SMTP_SSL(creds['smtp_server'], smtp_port)
-        else:
-            smtp = smtplib.SMTP(creds['smtp_server'], smtp_port)
-            smtp.starttls()
+        smtp = _smtp_connect(creds)
         with smtp:
-            smtp.login(creds['address'], creds['app_password'])
             smtp.send_message(msg)
 
         logger.info(f"Email sent to {to_name}: {subject}")
@@ -702,6 +927,7 @@ def execute(function_name, arguments, config):
                 subject=arguments.get('subject'),
                 body=body,
                 reply_to_index=arguments.get('reply_to_index'),
+                address=arguments.get('address'),
             )
         else:
             return f"Unknown email function '{function_name}'.", False

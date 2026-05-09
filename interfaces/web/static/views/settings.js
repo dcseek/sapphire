@@ -2,8 +2,10 @@
 // Tab handlers live in settings-tabs/*.js — this file stays lean.
 import * as api from '../shared/settings-api.js';
 import * as ui from '../ui.js';
+import { setupModalClose } from '../shared/modal.js';
 
 // Tab registry
+import dashboardTab from './settings-tabs/dashboard.js';
 import appearanceTab from './settings-tabs/appearance.js';
 import audioTab from './settings-tabs/audio.js';
 import ttsTab from './settings-tabs/tts.js';
@@ -17,13 +19,14 @@ import pluginsTab from './settings-tabs/plugins.js';
 
 import backupTab from './settings-tabs/backup.js';
 import systemTab from './settings-tabs/system.js';
+import helpTab from './settings-tabs/help-tab.js';
 
 import { getRegisteredTabs } from '../shared/plugin-registry.js';
 
-const STATIC_TABS = [appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, backupTab, systemTab];
+const STATIC_TABS = [dashboardTab, appearanceTab, audioTab, ttsTab, sttTab, embeddingTab, llmTab, toolsTab, networkTab, wakewordTab, pluginsTab, backupTab, systemTab, helpTab];
 
 let container = null;
-let activeTab = 'appearance';
+let activeTab = 'dashboard';
 let settings = {};
 let help = {};
 let overrides = [];
@@ -37,6 +40,7 @@ let pluginList = [];
 let lockedPlugins = [];
 let mobileMenuCleanup = null;
 let managed = false;
+let docker = false;
 let unrestricted = false;
 
 export default {
@@ -60,6 +64,7 @@ async function loadData() {
         overrides = settingsData.user_overrides || [];
         help = helpData.help || {};
         managed = settingsData.managed || false;
+        docker = settingsData.docker || false;
         unrestricted = settingsData.unrestricted || false;
 
         await Promise.all([loadThemes(), loadWakewordModels(), loadProviderMeta(), loadPluginList()]);
@@ -76,10 +81,13 @@ async function loadPluginList() {
             const d = await res.json();
             pluginList = d.plugins || [];
             lockedPlugins = d.locked || [];
-            // Auto-load settings tabs for enabled plugins that have a web UI
-            for (const p of pluginList) {
-                if (p.enabled && p.settingsUI) await loadPluginTab(p.name, p.settingsUI).catch(() => {});
-            }
+            // Auto-load settings tabs for enabled plugins that have a web UI.
+            // Parallelized — sequential awaits here were making Settings tab load ~N*RTT
+            // slow (once per enabled plugin). Promise.all gives us max(RTT) instead.
+            const tabLoads = pluginList
+                .filter(p => p.enabled && p.settingsUI)
+                .map(p => loadPluginTab(p.name, p.settingsUI).catch(() => {}));
+            await Promise.all(tabLoads);
         }
     } catch {}
 }
@@ -202,6 +210,43 @@ function flushCurrentInputs() {
 
 // ── Rendering ──
 
+function renderSidebarItems(tabs) {
+    const coreTabs = tabs.filter(t => !t.isPlugin);
+    const pluginTabs = tabs.filter(t => t.isPlugin);
+    const pluginChildActive = pluginTabs.some(t => t.id === activeTab);
+
+    let html = '';
+    for (const t of coreTabs) {
+        html += `<button class="settings-nav-item${t.id === activeTab ? ' active' : ''}" data-tab="${t.id}">
+            <span class="settings-nav-icon">${t.icon}</span>
+            <span class="settings-nav-label">${t.name}</span>
+        </button>`;
+        // After the plugins tab, inject the collapsible plugin settings group
+        if (t.id === 'plugins' && pluginTabs.length) {
+            const open = pluginChildActive ? ' open' : '';
+            html += `<details class="settings-plugin-group"${open}>
+                <summary class="settings-plugin-group-label">Plugin Settings</summary>
+                ${pluginTabs.map(pt => `
+                    <button class="settings-nav-item settings-plugin-child${pt.id === activeTab ? ' active' : ''}" data-tab="${pt.id}">
+                        <span class="settings-nav-icon">${pt.icon}</span>
+                        <span class="settings-nav-label">${pt.name}</span>
+                    </button>
+                `).join('')}
+            </details>`;
+        }
+    }
+    return html;
+}
+
+function renderMobileItems(tabs) {
+    return tabs.map(t => `
+        <button class="settings-mobile-option${t.id === activeTab ? ' active' : ''}" data-tab="${t.id}">
+            <span class="settings-mobile-opt-icon">${t.icon}</span>
+            <span>${t.name}</span>
+        </button>
+    `).join('');
+}
+
 function render() {
     if (!container) return;
     const meta = getTabMeta();
@@ -210,12 +255,7 @@ function render() {
     container.innerHTML = `
         <div class="settings-view">
             <div class="settings-sidebar">
-                ${tabs.map(t => `
-                    <button class="settings-nav-item${t.id === activeTab ? ' active' : ''}${t.isPlugin ? ' plugin-tab' : ''}" data-tab="${t.id}">
-                        <span class="settings-nav-icon">${t.icon}</span>
-                        <span class="settings-nav-label">${t.name}</span>
-                    </button>
-                `).join('')}
+                ${renderSidebarItems(tabs)}
             </div>
             <div class="settings-main">
                 <div class="settings-mobile-nav">
@@ -225,12 +265,7 @@ function render() {
                         <span class="settings-mobile-arrow">&#x25BE;</span>
                     </button>
                     <div class="settings-mobile-menu hidden" id="settings-mobile-menu">
-                        ${tabs.map(t => `
-                            <button class="settings-mobile-option${t.id === activeTab ? ' active' : ''}" data-tab="${t.id}">
-                                <span class="settings-mobile-opt-icon">${t.icon}</span>
-                                <span>${t.name}</span>
-                            </button>
-                        `).join('')}
+                        ${renderMobileItems(tabs)}
                     </div>
                 </div>
                 <div class="settings-header">
@@ -275,7 +310,7 @@ function renderTabContent() {
 
 function createCtx() {
     return {
-        settings, help, overrides, pendingChanges, managed, unrestricted,
+        settings, help, overrides, pendingChanges, managed, docker, unrestricted,
         wakewordModels, availableThemes, avatarPaths, providerMeta,
         pluginList, lockedPlugins,
         renderFields, renderAccordion, renderInput, formatLabel,
@@ -404,6 +439,28 @@ function renderAccordion(id, keys, title = 'Advanced Settings') {
 // ── Events ──
 
 function bindShellEvents() {
+    // Navigate to a specific tab programmatically (used by plugin gear icons)
+    container.addEventListener('settings-navigate', e => {
+        const tabId = e.detail?.tab;
+        if (!tabId) return;
+        flushCurrentInputs();
+        activeTab = tabId;
+        container.querySelectorAll('.settings-nav-item').forEach(b =>
+            b.classList.toggle('active', b.dataset.tab === activeTab));
+        // Auto-expand plugin group if navigating to a plugin tab
+        const pluginGroup = container.querySelector('.settings-plugin-group');
+        if (pluginGroup) {
+            const isPluginTab = pluginGroup.querySelector(`.settings-nav-item[data-tab="${tabId}"]`);
+            if (isPluginTab) pluginGroup.open = true;
+        }
+        const meta = getTabMeta();
+        const title = container.querySelector('#stab-title');
+        const desc = container.querySelector('#stab-desc');
+        if (title) title.textContent = `${meta.icon} ${meta.name}`;
+        if (desc) desc.textContent = meta.description || '';
+        renderTabContent();
+    });
+
     // Sidebar nav
     container.querySelector('.settings-sidebar')?.addEventListener('click', e => {
         const btn = e.target.closest('.settings-nav-item');
@@ -611,13 +668,54 @@ async function saveChanges() {
     const saveBtn = container?.querySelector('#settings-save');
     if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
 
+    // Embedding provider swap gate: swapping providers leaves existing stored
+    // vectors stamped with the old provider, which means they're invisible to
+    // vector search under the new one until re-embedded. Show the user real
+    // counts and let them back out. This is the ONLY multi-setting gate — the
+    // embedding surface touches 3 DBs and years of data.
+    // The server enforces the same gate via 409 — this UI path is for the
+    // friendly count-of-affected display.
+    let confirmEmbeddingSwap = false;
+    if ('EMBEDDING_PROVIDER' in valid && valid.EMBEDDING_PROVIDER !== settings.EMBEDDING_PROVIDER) {
+        try {
+            const res = await fetch('/api/embedding/integrity');
+            if (res.ok) {
+                const report = await res.json();
+                const tables = report.tables || {};
+                const countAffected = (t) => (t.matching_active || 0) + (t.legacy_unstamped || 0);
+                const mem = countAffected(tables.memories || {});
+                const know = countAffected(tables.knowledge_entries || {});
+                const people = countAffected(tables.people || {});
+                const total = mem + know + people;
+                if (total > 0) {
+                    const msg =
+                        `Swap embedding provider to "${valid.EMBEDDING_PROVIDER}"?\n\n` +
+                        `This will make existing vectors invisible to semantic search until re-embedded:\n` +
+                        `  • ${mem} memory vectors\n` +
+                        `  • ${know} knowledge-entry vectors\n` +
+                        `  • ${people} people vectors\n\n` +
+                        `The data itself is preserved. FTS5 text search still works on all rows. ` +
+                        `A re-embed pipeline is coming soon — for now, plan to re-save memories/knowledge manually if needed.`;
+                    if (!confirm(msg)) {
+                        if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save Changes'; }
+                        return;
+                    }
+                    confirmEmbeddingSwap = true;
+                }
+            }
+        } catch (e) {
+            console.warn('[embedding] integrity pre-save check failed:', e);
+            // Don't block save on a fetch failure — user is trying to do the right thing
+        }
+    }
+
     try {
         const parsed = {};
         for (const [key, value] of Object.entries(valid)) {
             parsed[key] = api.parseValue(value, settings[key]);
         }
 
-        const result = await api.updateSettingsBatch(parsed);
+        const result = await api.updateSettingsBatch(parsed, { confirm_embedding_swap: confirmEmbeddingSwap });
         await api.reloadSettings();
         ui.showToast(`Saved ${Object.keys(parsed).length} settings`, 'success');
 
@@ -655,7 +753,7 @@ function showHelpPopup(key) {
         </div>
     `;
     document.body.appendChild(popup);
-    popup.addEventListener('click', e => { if (e.target === popup) popup.remove(); });
+    setupModalClose(popup, () => popup.remove());
     popup.querySelector('#help-close')?.addEventListener('click', () => popup.remove());
 }
 
@@ -684,8 +782,8 @@ function _showVoicePicker(voices, targetInput, parentEl) {
         </div>
     `;
     document.body.appendChild(popup);
+    setupModalClose(popup, () => popup.remove());
     popup.addEventListener('click', e => {
-        if (e.target === popup) { popup.remove(); return; }
         const opt = e.target.closest('.voice-option');
         if (opt) {
             const id = opt.dataset.voiceId;

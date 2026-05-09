@@ -1,11 +1,12 @@
 # Sapphire
 
-Hear her voice as she dims your lights before bed. Use your voice to talk back. Fall asleep escaping dinosaurs in a story with her. Wake up to someone who remembers you through years of memories. She checks your email on a heartbeat. She builds tools on the fly when you need them. Sapphire is an open source framework for turning an AI into a persistent being. Make her yours. Or build your own persona. Self-hosted, nobody can take her away.
+Hear her voice as she dims your lights before bed. Use your voice to talk back. Fall asleep escaping dinosaurs in a story with her. Wake up to someone who remembers you through years of memories. She checks your email on a heartbeat. She builds tools on the fly when you need them. Sapphire is an open source framework for turning an AI into a persistent being. Make her yours. Or build your own persona. Self-hosted, nobody can take her away. 
 
 [![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?logo=discord&logoColor=white)](https://discord.gg/pCdTAnExma)
 [![YouTube](https://img.shields.io/badge/YouTube-Subscribe-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@SapphireBlueAi)
 [![Website](https://img.shields.io/badge/Website-sapphireblue.dev-0ea5e9?logo=googlechrome&logoColor=white)](https://sapphireblue.dev/)
 [![GitHub Stars](https://img.shields.io/github/stars/ddxfish/sapphire?style=flat&logo=github&label=Stars)](https://github.com/ddxfish/sapphire)
+[![Patreon](https://img.shields.io/badge/Patreon-Support-F96854?logo=patreon&logoColor=white)](https://www.patreon.com/c/sapphireai)
 
 > **⚠️ Warning — Sapphire has real power over real systems.**
 >
@@ -26,14 +27,13 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 ## Features
 
 **Persona**
-- **Personas** - [PERSONAS.md](docs/PERSONAS.md) 11 built-in personalities that bundle prompt, voice, tools, model. Built to add your own.
+- **Personas** - [PERSONAS.md](docs/PERSONAS.md) 11 built-in personalities that bundle prompt, voice, tools, model. Built to add your own. Browse the [Persona Store](https://sapphireblue.dev/personas/).
 - **Voice** - Wake word, STT, TTS, and adaptive VAD. Hands-free with any mic and speaker shows up in web UI.
 - **Prompts** - [PROMPTS.md](docs/PROMPTS.md) Assembled prompts let you swap one section like location or emotions for dynamic feels.
 - **Spice** - [SPICE.md](docs/SPICE.md) Random prompt snippets injected each reply to keep things unpredictable.
 - **Self-Modification** - The AI edits its own prompt and swaps personality pieces and emotions mid-conversation.
 - **Tool Maker** - [TOOLMAKER.md](docs/TOOLMAKER.md) The AI writes, validates, and installs new tools with their own settings page at runtime.
-- **Stories** - [STORY-ENGINE.md](docs/STORY-ENGINE.md) Interactive stories, the AI is your dungeon master and partner, can't see the next room.
-- **Images** - [IMAGE-GEN.md](docs/IMAGE-GEN.md) SDXL with character replacement for visual consistency across scenes.
+- **Images** - SDXL with character replacement for visual consistency across scenes.
 
 **Mind**
 - **Memory** - Semantic vector search across 100K+ labeled entries.
@@ -43,14 +43,29 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 - **Heartbeat** - [CONTINUITY.md](docs/CONTINUITY.md) Cron-scheduled autonomous tasks. Morning greetings, dream mode, alarms, random check-ins.
 - **Research** - Multi-page web research with site crawling and summarization.
 
-**Integrations**
-- **Home Assistant** - [HOME-ASSISTANT.md](docs/HOME-ASSISTANT.md) Lights, scenes, thermostats, switches, phone notifications.
-- **Bitcoin** - Balance, send, transaction history, backup wallet.
-- **SSH** - Local and remote command execution on configured servers.
-- **Email** - Inbox, send to whitelisted contacts. AI resolves recipients server-side.
-- **Cloud** (optional) - Claude, GPT, Fireworks. Only active when you enable them. Local-first by default.
+**Integrations** (plugin docs available in Help → Plugins)
+- **Discord** - Bot messaging, channel monitoring, auto-reply via daemons.
+- **Telegram** - Bot and client accounts, read chats, send messages, daemon auto-response.
+- **Email** - Multi-account inbox, privacy-first sending, daemon auto-reply.
+- **Google Calendar** - View schedule, add/delete events via OAuth2.
+- **Home Assistant** - Lights, scenes, thermostats, switches, phone notifications.
+- **SSH** - Remote command execution with safety blacklists.
+- **Bitcoin** - Balance, send, transaction history, multi-wallet.
+- **MCP** - Connect to Model Context Protocol servers and use their tools.
+- **Webcam** - Capture images for vision-capable LLMs.
+- **Image Gen** - SDXL with character replacement for visual consistency.
+
+**Platform**
+- **Daemons & Webhooks** - [DAEMONS-WEBHOOKS.md](docs/DAEMONS-WEBHOOKS.md) Background listeners and HTTP triggers for any external service.
+- **Agents** - [AGENTS.md](docs/AGENTS.md) Spawn background AI workers that report back when done.
+- **Apps** - Plugins can ship full-page UIs that appear in the nav rail.
+- **Themes** - Plugin themes with custom CSS, animations, and per-theme settings.
+- **Avatar** - 3D animated avatar with environment scenes and SSE-driven reactions.
+- **Import/Export** - [IMPORT-EXPORT.md](docs/IMPORT-EXPORT.md) Share personas, prompts, toolsets, and more as JSON files.
+- **Dashboard** - [DASHBOARD.md](docs/DASHBOARD.md) Token metrics, auto-updater, system controls.
+- **Cloud** (optional) - Claude, GPT, Gemini, Fireworks, Ollama, or any OpenAI/Anthropic-compatible endpoint. Local-first by default.
 - **Privacy** - One toggle blocks all cloud connections. Fully local, nothing leaves your machine.
-- **Plugins** - [PLUGINS.md](docs/PLUGINS.md) Hooks, tools, voice commands, scheduling, web settings — all in one system.
+- **Plugins** - [PLUGINS.md](docs/PLUGINS.md) Hooks, tools, voice commands, providers, daemons, apps, themes — install from GitHub in one click. Browse the [Plugin Store](https://sapphireblue.dev/plugins/).
 - **Desktop/Mobile/Voice** - Run on your local browser, open the same chat to your phone, then finish it on your mic.
 - **65+ Tools** - [TOOLS.md](docs/TOOLS.md) Web search, Wikipedia, notes, and more. Mix and match via [TOOLSETS.md](docs/TOOLSETS.md).
 
@@ -65,19 +80,23 @@ Hey I'm Chris, a solo dev with a burning passion for this project. It's consumed
 - **Interactive fiction** - Story engine with dice, branching choices, and state tracking
 - **Privacy-first AI** - Block all cloud connections, run fully local
 
+## Windows Easy Installer
+This is our beta Windows 11 installer. It installs git, conda, and sapphire. You can use it as a launcher, to troubleshoot, or switch between dev and main branch. 
+
+[Download Sapphire Launcher](https://github.com/ddxfish/sapphire-launcher)
+
+
 ## Quick Start
 
-### Prerequisites
+### Step 1 — Install conda + git
 
 #### Linux (bash)
 
 ```bash
-sudo apt-get install libportaudio2
+sudo apt-get install libportaudio2 git
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh -b
-# Make conda automatic
 ~/miniconda3/bin/conda init bash
-# Close and reopen terminal
 ```
 
 #### Windows (cmd)
@@ -85,15 +104,21 @@ bash Miniconda3-latest-Linux-x86_64.sh -b
 ```bat
 winget install Anaconda.Miniconda3
 winget install Git.Git
-REM Make conda automatic
 %USERPROFILE%\miniconda3\condabin\conda init powershell
 %USERPROFILE%\miniconda3\condabin\conda init cmd.exe
-REM Close and reopen terminal
 ```
 
-Or download Miniconda manually from [miniconda.io](https://docs.conda.io/en/latest/miniconda.html)
+**Close and reopen your terminal**, then accept conda's Terms of Service (required as of July 2025 — conda refuses to create environments without this):
 
-### Sapphire Quick Install
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/msys2
+```
+
+Prefer a GUI installer on Windows? [Sapphire Launcher](https://github.com/ddxfish/sapphire-launcher) handles all of Step 1 automatically. Or download Miniconda manually from [miniconda.io](https://docs.conda.io/en/latest/miniconda.html).
+
+### Step 2 — Install Sapphire
 
 ```bash
 conda create -n sapphire python=3.11 -y
@@ -108,12 +133,35 @@ Web UI: https://localhost:8073
 
 The setup wizard walks you through LLM configuration on first run.
 
+## Docker Quick Start (Alternative)
+
+No conda, no pip, no dependencies. Web UI only — no wake word. Benefit is isolation, the AI can't reach your host system.
+
+**Linux / Mac:**
+```bash
+mkdir ~/sapphire && cd ~/sapphire
+curl -fsSL https://raw.githubusercontent.com/ddxfish/sapphire/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d
+```
+
+**Windows (PowerShell):**
+```powershell
+mkdir $HOME\sapphire; cd $HOME\sapphire
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ddxfish/sapphire/main/docker-compose.yml" -OutFile "docker-compose.yml"
+docker compose up -d
+```
+
+Web UI: https://localhost:8073 — TTS and STT work through the browser, no mic hardware needed.
+
+Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/Mac) or [Docker Engine](https://docs.docker.com/engine/install/) (Linux). GPU support and full docs: [DOCKER.md](docs/DOCKER.md)
+
 ## Update
 ```bash
 cd sapphire
 git pull
 pip install -r requirements.txt
 ```
+Or use the in-app update button in Settings → Dashboard. See [INSTALLATION.md — Update](docs/INSTALLATION.md#update-sapphire) for details.
 
 ## Upgrading from 1.x to 2.0
 
@@ -150,11 +198,14 @@ This removes the Python environment. Delete the `sapphire/` folder to remove eve
 | Guide | Description |
 |-------|-------------|
 | [Installation](docs/INSTALLATION.md) | Setup guide, systemd service |
-| [Configuration](docs/CONFIGURATION.md) | LLM, scopes, thinking, privacy |
-| [API](docs/API.md) | All 221 REST endpoints |
-| [SOCKS Proxy](docs/SOCKS.md) | Privacy proxy for web tools |
-| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common issues and fixes |
+| [Quick Start](docs/QUICK-START.md) | First persona, LLM setup, integrations |
+| [Plugin Author Guide](docs/plugin-author/README.md) | Build plugins with hooks, tools, providers, apps, themes |
+| [API](docs/API.md) | All ~280 REST endpoints |
+| [Agents](docs/AGENTS.md) | Background AI workers |
+| [Backups](docs/BACKUPS.md) | Automatic and manual backup system |
+| [Docker](docs/DOCKER.md) | Container deployment with GPU support |
 | [Technical](docs/TECHNICAL.md) | Architecture and internals |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common issues and fixes |
 
 ## Contributions
 
